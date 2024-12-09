@@ -20,6 +20,7 @@ package cmd
 import (
 	"fmt"
 	"math"
+	"sync/atomic"
 	"time"
 
 	"github.com/minio/madmin-go/v3"
@@ -107,18 +108,18 @@ func (l ReplicationLastHour) merge(o ReplicationLastHour) (merged ReplicationLas
 
 // Add  a new duration data
 func (l *ReplicationLastHour) addsize(sz int64) {
-	min := time.Now().Unix() / 60
-	l.forwardTo(min)
-	winIdx := min % 60
-	l.Totals[winIdx].merge(AccElem{Total: min, Size: sz, N: 1})
-	l.LastMin = min
+	minutes := time.Now().Unix() / 60
+	l.forwardTo(minutes)
+	winIdx := minutes % 60
+	l.Totals[winIdx].merge(AccElem{Total: minutes, Size: sz, N: 1})
+	l.LastMin = minutes
 }
 
 // Merge all recorded counts of last hour into one
 func (l *ReplicationLastHour) getTotal() AccElem {
 	var res AccElem
-	min := time.Now().Unix() / 60
-	l.forwardTo(min)
+	minutes := time.Now().Unix() / 60
+	l.forwardTo(minutes)
 	for _, elem := range l.Totals[:] {
 		res.merge(elem)
 	}
@@ -127,8 +128,7 @@ func (l *ReplicationLastHour) getTotal() AccElem {
 
 // forwardTo time t, clearing any entries in between.
 func (l *ReplicationLastHour) forwardTo(t int64) {
-	tMin := t / 60
-	if l.LastMin >= tMin {
+	if l.LastMin >= t {
 		return
 	}
 	if t-l.LastMin >= 60 {
@@ -154,6 +154,7 @@ type BucketStats struct {
 	Uptime           int64                  `json:"uptime"`
 	ReplicationStats BucketReplicationStats `json:"currStats"`  // current replication stats since cluster startup
 	QueueStats       ReplicationQueueStats  `json:"queueStats"` // replication queue stats
+	ProxyStats       ProxyMetric            `json:"proxyStats"`
 }
 
 // BucketReplicationStats represents inline replication statistics
@@ -309,10 +310,18 @@ type ReplQNodeStats struct {
 func (r *ReplicationStats) getNodeQueueStats(bucket string) (qs ReplQNodeStats) {
 	qs.NodeName = globalLocalNodeName
 	qs.Uptime = UTCNow().Unix() - globalBootTime.Unix()
-	qs.ActiveWorkers = globalReplicationStats.ActiveWorkers()
+	grs := globalReplicationStats.Load()
+	if grs != nil {
+		qs.ActiveWorkers = grs.ActiveWorkers()
+	} else {
+		qs.ActiveWorkers = ActiveWorkerStat{}
+	}
 	qs.XferStats = make(map[RMetricName]XferStats)
 	qs.QStats = r.qCache.getBucketStats(bucket)
 	qs.TgtXferStats = make(map[string]map[RMetricName]XferStats)
+	qs.MRFStats = ReplicationMRFStats{
+		LastFailedCount: atomic.LoadUint64(&r.mrfStats.LastFailedCount),
+	}
 
 	r.RLock()
 	defer r.RUnlock()
@@ -398,10 +407,12 @@ func (r *ReplicationStats) getNodeQueueStats(bucket string) (qs ReplQNodeStats) 
 func (r *ReplicationStats) getNodeQueueStatsSummary() (qs ReplQNodeStats) {
 	qs.NodeName = globalLocalNodeName
 	qs.Uptime = UTCNow().Unix() - globalBootTime.Unix()
-	qs.ActiveWorkers = globalReplicationStats.ActiveWorkers()
+	qs.ActiveWorkers = globalReplicationStats.Load().ActiveWorkers()
 	qs.XferStats = make(map[RMetricName]XferStats)
 	qs.QStats = r.qCache.getSiteStats()
-
+	qs.MRFStats = ReplicationMRFStats{
+		LastFailedCount: atomic.LoadUint64(&r.mrfStats.LastFailedCount),
+	}
 	r.RLock()
 	defer r.RUnlock()
 	tx := newXferStats()

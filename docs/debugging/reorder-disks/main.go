@@ -30,7 +30,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/minio/pkg/v2/ellipses"
+	"github.com/minio/pkg/v3/ellipses"
 )
 
 type xl struct {
@@ -56,7 +56,7 @@ func getMountMap() (map[string]string, error) {
 	for scanner.Scan() {
 		s := strings.Split(scanner.Text(), " ")
 		if len(s) != 11 {
-			return nil, errors.New("unsupport /proc/self/mountinfo format")
+			return nil, errors.New("unsupported /proc/self/mountinfo format")
 		}
 		result[s[2]] = s[9]
 	}

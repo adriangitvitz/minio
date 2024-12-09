@@ -14,7 +14,7 @@ clusterDomain: cluster.local
 ##
 image:
   repository: quay.io/minio/minio
-  tag: RELEASE.2023-09-30T07-02-29Z
+  tag: RELEASE.2024-04-18T19-09-19Z
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -25,7 +25,7 @@ imagePullSecrets: []
 ##
 mcImage:
   repository: quay.io/minio/mc
-  tag: RELEASE.2023-09-29T16-41-22Z
+  tag: RELEASE.2024-04-18T16-45-29Z
   pullPolicy: IfNotPresent
 
 ## minio mode, i.e. standalone or distributed
@@ -45,6 +45,9 @@ ignoreChartChecksums: false
 
 ## Additional arguments to pass to minio binary
 extraArgs: []
+# example for enabling FTP:
+#   - --ftp=\"address=:8021\"
+#   - --ftp=\"passive-port-range=10000-10010\"
 
 ## Additional volumes to minio container
 extraVolumes: []
@@ -84,7 +87,7 @@ priorityClassName: ""
 runtimeClassName: ""
 
 ## Set default rootUser, rootPassword
-## AccessKey and secretKey is generated when not set
+## rootUser and rootPassword is generated when not set
 ## Distributed MinIO ref: https://min.io/docs/minio/linux/operations/install-deploy-manage/deploy-minio-multi-node-multi-drive.html
 ##
 rootUser: ""
@@ -179,6 +182,18 @@ service:
   externalIPs: []
   annotations: {}
 
+  ## service.loadBalancerSourceRanges Addresses that are allowed when service is LoadBalancer
+  ## https://kubernetes.io/docs/tasks/access-application-cluster/configure-cloud-provider-firewall/#restrict-access-for-loadbalancer-service
+  ##
+  #loadBalancerSourceRanges:
+  #   - 10.10.10.0/24
+  loadBalancerSourceRanges: []
+
+  ## service.externalTrafficPolicy minio service external traffic policy
+  ## ref http://kubernetes.io/docs/tasks/access-application-cluster/create-external-load-balancer/#preserving-the-client-source-ip
+  ##
+  externalTrafficPolicy: Cluster
+
 ## Configure Ingress based on the documentation here: https://kubernetes.io/docs/concepts/services-networking/ingress/
 ##
 
@@ -211,6 +226,17 @@ consoleService:
   loadBalancerIP: ~
   externalIPs: []
   annotations: {}
+  ## consoleService.loadBalancerSourceRanges Addresses that are allowed when service is LoadBalancer
+  ## https://kubernetes.io/docs/tasks/access-application-cluster/configure-cloud-provider-firewall/#restrict-access-for-loadbalancer-service
+  ##
+  #loadBalancerSourceRanges:
+  #   - 10.10.10.0/24
+  loadBalancerSourceRanges: []
+
+  ## servconsoleServiceice.externalTrafficPolicy minio service external traffic policy
+  ## ref http://kubernetes.io/docs/tasks/access-application-cluster/create-external-load-balancer/#preserving-the-client-source-ip
+  ##
+  externalTrafficPolicy: Cluster
 
 consoleIngress:
   enabled: false
@@ -249,6 +275,9 @@ securityContext:
   runAsGroup: 1000
   fsGroup: 1000
   fsGroupChangePolicy: "OnRootMismatch"
+
+containerSecurityContext:
+  readOnlyRootFilesystem: false
 
 # Additational pod annotations
 podAnnotations: {}
@@ -411,7 +440,7 @@ buckets: []
   #   purge: false
   #   # set versioning for
   #   # bucket [true|false]
-  #   versioning: false
+  #   versioning: false # remove this key if you do not want versioning feature
   #   # set objectlocking for
   #   # bucket [true|false] NOTE: versioning is enabled by default if you use locking
   #   objectlocking: false
@@ -449,6 +478,16 @@ customCommandJob:
   resources:
     requests:
       memory: 128Mi
+  ## Additional volumes to add to the post-job.
+  extraVolumes: []
+    # - name: extra-policies
+    #   configMap:
+    #     name: my-extra-policies-cm
+  ## Additional volumeMounts to add to the custom commands container when
+  ## running the post-job.
+  extraVolumeMounts: []
+    # - name: extra-policies
+    #   mountPath: /mnt/extras/
   # Command to run after the main command on exit
   exitCommand: ""
 
@@ -486,8 +525,9 @@ oidc:
   configUrl: "https://identity-provider-url/.well-known/openid-configuration"
   clientId: "minio"
   clientSecret: ""
-  # Provide existing client secret from the Kubernetes Secret resource, existing secret will have priority over `clientSecret`
+  # Provide existing client secret from the Kubernetes Secret resource, existing secret will have priority over `clientId` and/or `clientSecret``
   existingClientSecretName: ""
+  existingClientIdKey: ""
   existingClientSecretKey: ""
   claimName: "policy"
   scopes: "openid,profile,email"
@@ -495,10 +535,17 @@ oidc:
   # Can leave empty
   claimPrefix: ""
   comment: ""
+  displayName: ""
 
 networkPolicy:
   enabled: false
+  # Specifies whether the policies created will be standard Network Policies (flavor: kubernetes)
+  # or Cilium Network Policies (flavor: cilium)
+  flavor: kubernetes
   allowExternal: true
+  # only when using flavor: cilium
+  egressEntities:
+   - kube-apiserver
 
 ## PodDisruptionBudget settings
 ## ref: https://kubernetes.io/docs/concepts/workloads/pods/disruptions/

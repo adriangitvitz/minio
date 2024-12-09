@@ -21,13 +21,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/gob"
-	"encoding/pem"
 	"errors"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/url"
 	"os"
@@ -46,11 +43,10 @@ import (
 	"github.com/inconshreveable/mousetrap"
 	dns2 "github.com/miekg/dns"
 	"github.com/minio/cli"
+	consoleapi "github.com/minio/console/api"
+	"github.com/minio/console/api/operations"
 	consoleoauth2 "github.com/minio/console/pkg/auth/idp/oauth2"
 	consoleCerts "github.com/minio/console/pkg/certs"
-	"github.com/minio/console/restapi"
-	"github.com/minio/console/restapi/operations"
-	"github.com/minio/kes-go"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/set"
@@ -59,19 +55,28 @@ import (
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/certs"
-	"github.com/minio/pkg/v2/console"
-	"github.com/minio/pkg/v2/ellipses"
-	"github.com/minio/pkg/v2/env"
-	xnet "github.com/minio/pkg/v2/net"
+	"github.com/minio/pkg/v3/certs"
+	"github.com/minio/pkg/v3/console"
+	"github.com/minio/pkg/v3/env"
+	xnet "github.com/minio/pkg/v3/net"
+	"golang.org/x/term"
 )
 
 // serverDebugLog will enable debug printing
-var serverDebugLog = env.Get("_MINIO_SERVER_DEBUG", config.EnableOff) == config.EnableOn
-
-var shardDiskTimeDelta time.Duration
+var (
+	serverDebugLog     = env.Get("_MINIO_SERVER_DEBUG", config.EnableOff) == config.EnableOn
+	currentReleaseTime time.Time
+	orchestrated       = IsKubernetes() || IsDocker()
+)
 
 func init() {
+	if !term.IsTerminal(int(os.Stdout.Fd())) || !term.IsTerminal(int(os.Stderr.Fd())) {
+		color.TurnOff()
+	}
+	if env.Get("NO_COLOR", "") != "" || env.Get("TERM", "") == "dumb" {
+		color.TurnOff()
+	}
+
 	if runtime.GOOS == "windows" {
 		if mousetrap.StartedByExplorer() {
 			fmt.Printf("Don't double-click %s\n", os.Args[0])
@@ -83,15 +88,8 @@ func init() {
 		}
 	}
 
-	rand.Seed(time.Now().UTC().UnixNano())
-
 	logger.Init(GOPATH, GOROOT)
 	logger.RegisterError(config.FmtError)
-
-	initGlobalContext()
-
-	globalBatchJobsMetrics = batchJobMetrics{metrics: make(map[string]*batchJobInfo)}
-	go globalBatchJobsMetrics.purgeJobMetrics()
 
 	t, _ := minioVersionToReleaseTime(Version)
 	if !t.IsZero() {
@@ -105,18 +103,15 @@ func init() {
 	gob.Register(StorageErr(""))
 	gob.Register(madmin.TimeInfo{})
 	gob.Register(madmin.XFSErrorConfigs{})
+	gob.Register(map[string]string{})
 	gob.Register(map[string]interface{}{})
-
-	var err error
-	shardDiskTimeDelta, err = time.ParseDuration(env.Get("_MINIO_SHARD_DISKTIME_DELTA", "1m"))
-	if err != nil {
-		shardDiskTimeDelta = 1 * time.Minute
-	}
 
 	// All minio-go and madmin-go API operations shall be performed only once,
 	// another way to look at this is we are turning off retries.
 	minio.MaxRetry = 1
 	madmin.MaxRetry = 1
+
+	currentReleaseTime, _ = GetCurrentReleaseTime()
 }
 
 const consolePrefix = "CONSOLE_"
@@ -136,6 +131,12 @@ func minioConfigToConsoleFeatures() {
 		if value := env.Get(config.EnvMinIOLogQueryAuthToken, ""); value != "" {
 			os.Setenv("CONSOLE_LOG_QUERY_AUTH_TOKEN", value)
 		}
+	}
+	if value := env.Get(config.EnvBrowserRedirectURL, ""); value != "" {
+		os.Setenv("CONSOLE_BROWSER_REDIRECT_URL", value)
+	}
+	if value := env.Get(config.EnvConsoleDebugLogLevel, ""); value != "" {
+		os.Setenv("CONSOLE_DEBUG_LOGLEVEL", value)
 	}
 	// pass the console subpath configuration
 	if globalBrowserRedirectURL != nil {
@@ -175,8 +176,28 @@ func minioConfigToConsoleFeatures() {
 		os.Setenv("CONSOLE_STS_DURATION", valueSession)
 	}
 
-	os.Setenv("CONSOLE_MINIO_REGION", globalSite.Region)
+	os.Setenv("CONSOLE_MINIO_SITE_NAME", globalSite.Name())
+	os.Setenv("CONSOLE_MINIO_SITE_REGION", globalSite.Region())
+	os.Setenv("CONSOLE_MINIO_REGION", globalSite.Region())
+
 	os.Setenv("CONSOLE_CERT_PASSWD", env.Get("MINIO_CERT_PASSWD", ""))
+
+	// This section sets Browser (console) stored config
+	if valueSCP := globalBrowserConfig.GetCSPolicy(); valueSCP != "" {
+		os.Setenv("CONSOLE_SECURE_CONTENT_SECURITY_POLICY", valueSCP)
+	}
+
+	if hstsSeconds := globalBrowserConfig.GetHSTSSeconds(); hstsSeconds > 0 {
+		isubdom := globalBrowserConfig.IsHSTSIncludeSubdomains()
+		isprel := globalBrowserConfig.IsHSTSPreload()
+		os.Setenv("CONSOLE_SECURE_STS_SECONDS", strconv.Itoa(hstsSeconds))
+		os.Setenv("CONSOLE_SECURE_STS_INCLUDE_SUB_DOMAINS", isubdom)
+		os.Setenv("CONSOLE_SECURE_STS_PRELOAD", isprel)
+	}
+
+	if valueRefer := globalBrowserConfig.GetReferPolicy(); valueRefer != "" {
+		os.Setenv("CONSOLE_SECURE_REFERRER_POLICY", valueRefer)
+	}
 
 	globalSubnetConfig.ApplyEnv()
 }
@@ -207,7 +228,7 @@ func buildOpenIDConsoleConfig() consoleoauth2.OpenIDPCfg {
 	return m
 }
 
-func initConsoleServer() (*restapi.Server, error) {
+func initConsoleServer() (*consoleapi.Server, error) {
 	// unset all console_ environment variables.
 	for _, cenv := range env.List(consolePrefix) {
 		os.Unsetenv(cenv)
@@ -225,9 +246,9 @@ func initConsoleServer() (*restapi.Server, error) {
 	}
 
 	// set certs before other console initialization
-	restapi.GlobalRootCAs, restapi.GlobalPublicCerts, restapi.GlobalTLSCertsManager = globalRootCAs, globalPublicCerts, globalTLSCerts
+	consoleapi.GlobalRootCAs, consoleapi.GlobalPublicCerts, consoleapi.GlobalTLSCertsManager = globalRootCAs, globalPublicCerts, globalTLSCerts
 
-	swaggerSpec, err := loads.Embedded(restapi.SwaggerJSON, restapi.FlatSwaggerJSON)
+	swaggerSpec, err := loads.Embedded(consoleapi.SwaggerJSON, consoleapi.FlatSwaggerJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -238,18 +259,18 @@ func initConsoleServer() (*restapi.Server, error) {
 		// Disable console logging if server debug log is not enabled
 		noLog := func(string, ...interface{}) {}
 
-		restapi.LogInfo = noLog
-		restapi.LogError = noLog
+		consoleapi.LogInfo = noLog
+		consoleapi.LogError = noLog
 		api.Logger = noLog
 	}
 
 	// Pass in console application config. This needs to happen before the
 	// ConfigureAPI() call.
-	restapi.GlobalMinIOConfig = restapi.MinIOConfig{
+	consoleapi.GlobalMinIOConfig = consoleapi.MinIOConfig{
 		OpenIDProviders: buildOpenIDConsoleConfig(),
 	}
 
-	server := restapi.NewServer(api)
+	server := consoleapi.NewServer(api)
 	// register all APIs
 	server.ConfigureAPI()
 
@@ -257,16 +278,16 @@ func initConsoleServer() (*restapi.Server, error) {
 
 	server.Host = globalMinioConsoleHost
 	server.Port = consolePort
-	restapi.Port = globalMinioConsolePort
-	restapi.Hostname = globalMinioConsoleHost
+	consoleapi.Port = globalMinioConsolePort
+	consoleapi.Hostname = globalMinioConsoleHost
 
 	if globalIsTLS {
 		// If TLS certificates are provided enforce the HTTPS.
 		server.EnabledListeners = []string{"https"}
 		server.TLSPort = consolePort
 		// Need to store tls-port, tls-host un config variables so secure.middleware can read from there
-		restapi.TLSPort = globalMinioConsolePort
-		restapi.Hostname = globalMinioConsoleHost
+		consoleapi.TLSPort = globalMinioConsolePort
+		consoleapi.Hostname = globalMinioConsoleHost
 	}
 
 	return server, nil
@@ -284,9 +305,7 @@ func checkUpdate(mode string) {
 		return
 	}
 
-	// Its OK to ignore any errors during doUpdate() here.
-	crTime, err := GetCurrentReleaseTime()
-	if err != nil {
+	if currentReleaseTime.IsZero() {
 		return
 	}
 
@@ -297,8 +316,8 @@ func checkUpdate(mode string) {
 
 	var older time.Duration
 	var downloadURL string
-	if lrTime.After(crTime) {
-		older = lrTime.Sub(crTime)
+	if lrTime.After(currentReleaseTime) {
+		older = lrTime.Sub(currentReleaseTime)
 		downloadURL = getDownloadURL(releaseTimeToReleaseTag(lrTime))
 	}
 
@@ -307,7 +326,7 @@ func checkUpdate(mode string) {
 		return
 	}
 
-	logger.Info(prepareUpdateMessage("Run `mc admin update`", lrTime.Sub(crTime)))
+	logger.Info(prepareUpdateMessage("Run `mc admin update ALIAS`", lrTime.Sub(currentReleaseTime)))
 }
 
 func newConfigDir(dir string, dirSet bool, getDefaultDir func() string) (*ConfigDir, error) {
@@ -354,11 +373,16 @@ func buildServerCtxt(ctx *cli.Context, ctxt *serverCtxt) (err error) {
 		ctxt.ConsoleAddr = ctx.String("console-address")
 	}
 
-	// Check "no-compat" flag from command line argument.
-	ctxt.StrictS3Compat = true
-	if ctx.IsSet("no-compat") || ctx.GlobalIsSet("no-compat") {
-		ctxt.StrictS3Compat = false
+	if cxml := ctx.String("crossdomain-xml"); cxml != "" {
+		buf, err := os.ReadFile(cxml)
+		if err != nil {
+			return err
+		}
+		ctxt.CrossDomainXML = string(buf)
 	}
+
+	// Check "no-compat" flag from command line argument.
+	ctxt.StrictS3Compat = !(ctx.IsSet("no-compat") || ctx.GlobalIsSet("no-compat"))
 
 	switch {
 	case ctx.IsSet("config-dir"):
@@ -378,17 +402,37 @@ func buildServerCtxt(ctx *cli.Context, ctxt *serverCtxt) (err error) {
 		ctxt.certsDirSet = true
 	}
 
+	memAvailable := availableMemory()
+	if ctx.IsSet("memlimit") || ctx.GlobalIsSet("memlimit") {
+		memlimit := ctx.String("memlimit")
+		if memlimit == "" {
+			memlimit = ctx.GlobalString("memlimit")
+		}
+		mlimit, err := humanize.ParseBytes(memlimit)
+		if err != nil {
+			return err
+		}
+		if mlimit > memAvailable {
+			logger.Info("WARNING: maximum memory available (%s) smaller than specified --memlimit=%s, ignoring --memlimit value",
+				humanize.IBytes(memAvailable), memlimit)
+		}
+		ctxt.MemLimit = mlimit
+	} else {
+		ctxt.MemLimit = memAvailable
+	}
+
+	if memAvailable < ctxt.MemLimit {
+		ctxt.MemLimit = memAvailable
+	}
+
 	ctxt.FTP = ctx.StringSlice("ftp")
 	ctxt.SFTP = ctx.StringSlice("sftp")
-
 	ctxt.Interface = ctx.String("interface")
 	ctxt.UserTimeout = ctx.Duration("conn-user-timeout")
-	ctxt.ConnReadDeadline = ctx.Duration("conn-read-deadline")
-	ctxt.ConnWriteDeadline = ctx.Duration("conn-write-deadline")
-
-	ctxt.ShutdownTimeout = ctx.Duration("shutdown-timeout")
+	ctxt.SendBufSize = ctx.Int("send-buf-size")
+	ctxt.RecvBufSize = ctx.Int("recv-buf-size")
 	ctxt.IdleTimeout = ctx.Duration("idle-timeout")
-	ctxt.ReadHeaderTimeout = ctx.Duration("read-header-timeout")
+	ctxt.UserTimeout = ctx.Duration("conn-user-timeout")
 
 	if conf := ctx.String("config"); len(conf) > 0 {
 		err = mergeServerCtxtFromConfigFile(conf, ctxt)
@@ -417,25 +461,27 @@ func handleCommonArgs(ctxt serverCtxt) {
 	certsDir := ctxt.CertsDir
 	certsSet := ctxt.certsDirSet
 
-	if consoleAddr == "" {
-		p, err := xnet.GetFreePort()
-		if err != nil {
-			logger.FatalIf(err, "Unable to get free port for Console UI on the host")
+	if globalBrowserEnabled {
+		if consoleAddr == "" {
+			p, err := xnet.GetFreePort()
+			if err != nil {
+				logger.FatalIf(err, "Unable to get free port for Console UI on the host")
+			}
+			// hold the port
+			l, err := net.Listen("TCP", fmt.Sprintf(":%s", p.String()))
+			if err == nil {
+				defer l.Close()
+			}
+			consoleAddr = net.JoinHostPort("", p.String())
 		}
-		// hold the port
-		l, err := net.Listen("TCP", fmt.Sprintf(":%s", p.String()))
-		if err == nil {
-			defer l.Close()
+
+		if _, _, err := net.SplitHostPort(consoleAddr); err != nil {
+			logger.FatalIf(err, "Unable to start listening on console port")
 		}
-		consoleAddr = net.JoinHostPort("", p.String())
-	}
 
-	if _, _, err := net.SplitHostPort(consoleAddr); err != nil {
-		logger.FatalIf(err, "Unable to start listening on console port")
-	}
-
-	if consoleAddr == addr {
-		logger.FatalIf(errors.New("--console-address cannot be same as --address"), "Unable to start the server")
+		if consoleAddr == addr {
+			logger.FatalIf(errors.New("--console-address cannot be same as --address"), "Unable to start the server")
+		}
 	}
 
 	globalMinioHost, globalMinioPort = mustSplitHostPort(addr)
@@ -448,7 +494,9 @@ func handleCommonArgs(ctxt serverCtxt) {
 		globalDynamicAPIPort = true
 	}
 
-	globalMinioConsoleHost, globalMinioConsolePort = mustSplitHostPort(consoleAddr)
+	if globalBrowserEnabled {
+		globalMinioConsoleHost, globalMinioConsolePort = mustSplitHostPort(consoleAddr)
+	}
 
 	if globalMinioPort == globalMinioConsolePort {
 		logger.FatalIf(errors.New("--console-address port cannot be same as --address port"), "Unable to start the server")
@@ -479,7 +527,11 @@ func runDNSCache(ctx *cli.Context) {
 	dnsTTL := ctx.Duration("dns-cache-ttl")
 	// Check if we have configured a custom DNS cache TTL.
 	if dnsTTL <= 0 {
-		dnsTTL = 10 * time.Minute
+		if orchestrated {
+			dnsTTL = 30 * time.Second
+		} else {
+			dnsTTL = 10 * time.Minute
+		}
 	}
 
 	// Call to refresh will refresh names in cache.
@@ -637,16 +689,6 @@ func loadEnvVarsFromFiles() {
 		}
 	}
 
-	if env.IsSet(kms.EnvKMSSecretKeyFile) {
-		kmsSecret, err := readFromSecret(env.Get(kms.EnvKMSSecretKeyFile, ""))
-		if err != nil {
-			logger.Fatal(err, "Unable to read the KMS secret key inherited from secret file")
-		}
-		if kmsSecret != "" {
-			os.Setenv(kms.EnvKMSSecretKey, kmsSecret)
-		}
-	}
-
 	if env.IsSet(config.EnvConfigEnvFile) {
 		ekvs, err := minioEnvironFromFile(env.Get(config.EnvConfigEnvFile, ""))
 		if err != nil && !os.IsNotExist(err) {
@@ -658,12 +700,16 @@ func loadEnvVarsFromFiles() {
 	}
 }
 
-func serverHandleEnvVars() {
+func serverHandleEarlyEnvVars() {
 	var err error
 	globalBrowserEnabled, err = config.ParseBool(env.Get(config.EnvBrowser, config.EnableOn))
 	if err != nil {
 		logger.Fatal(config.ErrInvalidBrowserValue(err), "Invalid MINIO_BROWSER value in environment variable")
 	}
+}
+
+func serverHandleEnvVars() {
+	var err error
 	if globalBrowserEnabled {
 		if redirectURL := env.Get(config.EnvBrowserRedirectURL, ""); redirectURL != "" {
 			u, err := xnet.ParseHTTPURL(redirectURL)
@@ -720,7 +766,7 @@ func serverHandleEnvVars() {
 	if len(domains) != 0 {
 		for _, domainName := range strings.Split(domains, config.ValueSeparator) {
 			if _, ok := dns2.IsDomainName(domainName); !ok {
-				logger.Fatal(config.ErrInvalidDomainValue(nil).Msg("Unknown value `%s`", domainName),
+				logger.Fatal(config.ErrInvalidDomainValue(nil).Msgf("Unknown value `%s`", domainName),
 					"Invalid MINIO_DOMAIN value in environment variable")
 			}
 			globalDomainNames = append(globalDomainNames, domainName)
@@ -729,7 +775,7 @@ func serverHandleEnvVars() {
 		lcpSuf := lcpSuffix(globalDomainNames)
 		for _, domainName := range globalDomainNames {
 			if domainName == lcpSuf && len(globalDomainNames) > 1 {
-				logger.Fatal(config.ErrOverlappingDomainValue(nil).Msg("Overlapping domains `%s` not allowed", globalDomainNames),
+				logger.Fatal(config.ErrOverlappingDomainValue(nil).Msgf("Overlapping domains `%s` not allowed", globalDomainNames),
 					"Invalid MINIO_DOMAIN value in environment variable")
 			}
 		}
@@ -786,7 +832,7 @@ func serverHandleEnvVars() {
 		}
 	}
 
-	globalDisableFreezeOnBoot = env.Get("_MINIO_DISABLE_API_FREEZE_ON_BOOT", "") == "true" || serverDebugLog
+	globalEnableSyncBoot = env.Get("MINIO_SYNC_BOOT", config.EnableOff) == config.EnableOn
 }
 
 func loadRootCredentials() {
@@ -795,6 +841,7 @@ func loadRootCredentials() {
 	// Check both cases and authenticate them if correctly defined
 	var user, password string
 	var hasCredentials bool
+	var legacyCredentials bool
 	//nolint:gocritic
 	if env.IsSet(config.EnvRootUser) && env.IsSet(config.EnvRootPassword) {
 		user = env.Get(config.EnvRootUser, "")
@@ -803,6 +850,7 @@ func loadRootCredentials() {
 	} else if env.IsSet(config.EnvAccessKey) && env.IsSet(config.EnvSecretKey) {
 		user = env.Get(config.EnvAccessKey, "")
 		password = env.Get(config.EnvSecretKey, "")
+		legacyCredentials = true
 		hasCredentials = true
 	} else if globalServerCtxt.RootUser != "" && globalServerCtxt.RootPwd != "" {
 		user, password = globalServerCtxt.RootUser, globalServerCtxt.RootPwd
@@ -811,8 +859,13 @@ func loadRootCredentials() {
 	if hasCredentials {
 		cred, err := auth.CreateCredentials(user, password)
 		if err != nil {
-			logger.Fatal(config.ErrInvalidCredentials(err),
-				"Unable to validate credentials inherited from the shell environment")
+			if legacyCredentials {
+				logger.Fatal(config.ErrInvalidCredentials(err),
+					"Unable to validate credentials inherited from the shell environment")
+			} else {
+				logger.Fatal(config.ErrInvalidRootUserCredentials(err),
+					"Unable to validate credentials inherited from the shell environment")
+			}
 		}
 		if env.IsSet(config.EnvAccessKey) && env.IsSet(config.EnvSecretKey) {
 			msg := fmt.Sprintf("WARNING: %s and %s are deprecated.\n"+
@@ -826,132 +879,39 @@ func loadRootCredentials() {
 	} else {
 		globalActiveCred = auth.DefaultCredentials
 	}
+
+	var err error
+	globalNodeAuthToken, err = authenticateNode(globalActiveCred.AccessKey, globalActiveCred.SecretKey)
+	if err != nil {
+		logger.Fatal(err, "Unable to generate internode credentials")
+	}
 }
 
 // Initialize KMS global variable after valiadating and loading the configuration.
 // It depends on KMS env variables and global cli flags.
 func handleKMSConfig() {
-	if env.IsSet(kms.EnvKMSSecretKey) && env.IsSet(kms.EnvKESEndpoint) {
-		logger.Fatal(errors.New("ambigious KMS configuration"), fmt.Sprintf("The environment contains %q as well as %q", kms.EnvKMSSecretKey, kms.EnvKESEndpoint))
+	present, err := kms.IsPresent()
+	if err != nil {
+		logger.Fatal(err, "Invalid KMS configuration specified")
+	}
+	if !present {
+		return
 	}
 
-	if env.IsSet(kms.EnvKMSSecretKey) {
-		KMS, err := kms.Parse(env.Get(kms.EnvKMSSecretKey, ""))
-		if err != nil {
-			logger.Fatal(err, "Unable to parse the KMS secret key inherited from the shell environment")
-		}
-		GlobalKMS = KMS
+	KMS, err := kms.Connect(GlobalContext, &kms.ConnectionOptions{
+		CADir: globalCertsCADir.Get(),
+	})
+	if err != nil {
+		logger.Fatal(err, "Failed to connect to KMS")
 	}
-	if env.IsSet(kms.EnvKESEndpoint) {
-		if env.IsSet(kms.EnvKESAPIKey) {
-			if env.IsSet(kms.EnvKESClientKey) {
-				logger.Fatal(errors.New("ambigious KMS configuration"), fmt.Sprintf("The environment contains %q as well as %q", kms.EnvKESAPIKey, kms.EnvKESClientKey))
-			}
-			if env.IsSet(kms.EnvKESClientCert) {
-				logger.Fatal(errors.New("ambigious KMS configuration"), fmt.Sprintf("The environment contains %q as well as %q", kms.EnvKESAPIKey, kms.EnvKESClientCert))
-			}
-		}
-		if !env.IsSet(kms.EnvKESKeyName) {
-			logger.Fatal(errors.New("Invalid KES configuration"), fmt.Sprintf("The mandatory environment variable %q not set", kms.EnvKESKeyName))
-		}
 
-		var endpoints []string
-		for _, endpoint := range strings.Split(env.Get(kms.EnvKESEndpoint, ""), ",") {
-			if strings.TrimSpace(endpoint) == "" {
-				continue
-			}
-			if !ellipses.HasEllipses(endpoint) {
-				endpoints = append(endpoints, endpoint)
-				continue
-			}
-			patterns, err := ellipses.FindEllipsesPatterns(endpoint)
-			if err != nil {
-				logger.Fatal(err, fmt.Sprintf("Invalid KES endpoint %q", endpoint))
-			}
-			for _, lbls := range patterns.Expand() {
-				endpoints = append(endpoints, strings.Join(lbls, ""))
-			}
-		}
-		rootCAs, err := certs.GetRootCAs(env.Get(kms.EnvKESServerCA, globalCertsCADir.Get()))
-		if err != nil {
-			logger.Fatal(err, fmt.Sprintf("Unable to load X.509 root CAs for KES from %q", env.Get(kms.EnvKESServerCA, globalCertsCADir.Get())))
-		}
-
-		var kmsConf kms.Config
-		if env.IsSet(kms.EnvKESAPIKey) {
-			key, err := kes.ParseAPIKey(env.Get(kms.EnvKESAPIKey, ""))
-			if err != nil {
-				logger.Fatal(err, fmt.Sprintf("Failed to parse KES API key from %q", env.Get(kms.EnvKESAPIKey, "")))
-			}
-			kmsConf = kms.Config{
-				Endpoints:    endpoints,
-				Enclave:      env.Get(kms.EnvKESEnclave, ""),
-				DefaultKeyID: env.Get(kms.EnvKESKeyName, ""),
-				APIKey:       key,
-				RootCAs:      rootCAs,
-			}
-		} else {
-			loadX509KeyPair := func(certFile, keyFile string) (tls.Certificate, error) {
-				// Manually load the certificate and private key into memory.
-				// We need to check whether the private key is encrypted, and
-				// if so, decrypt it using the user-provided password.
-				certBytes, err := os.ReadFile(certFile)
-				if err != nil {
-					return tls.Certificate{}, fmt.Errorf("Unable to load KES client certificate as specified by the shell environment: %v", err)
-				}
-				keyBytes, err := os.ReadFile(keyFile)
-				if err != nil {
-					return tls.Certificate{}, fmt.Errorf("Unable to load KES client private key as specified by the shell environment: %v", err)
-				}
-				privateKeyPEM, rest := pem.Decode(bytes.TrimSpace(keyBytes))
-				if len(rest) != 0 {
-					return tls.Certificate{}, errors.New("Unable to load KES client private key as specified by the shell environment: private key contains additional data")
-				}
-				if x509.IsEncryptedPEMBlock(privateKeyPEM) {
-					keyBytes, err = x509.DecryptPEMBlock(privateKeyPEM, []byte(env.Get(kms.EnvKESClientPassword, "")))
-					if err != nil {
-						return tls.Certificate{}, fmt.Errorf("Unable to decrypt KES client private key as specified by the shell environment: %v", err)
-					}
-					keyBytes = pem.EncodeToMemory(&pem.Block{Type: privateKeyPEM.Type, Bytes: keyBytes})
-				}
-				certificate, err := tls.X509KeyPair(certBytes, keyBytes)
-				if err != nil {
-					return tls.Certificate{}, fmt.Errorf("Unable to load KES client certificate as specified by the shell environment: %v", err)
-				}
-				return certificate, nil
-			}
-
-			reloadCertEvents := make(chan tls.Certificate, 1)
-			certificate, err := certs.NewCertificate(env.Get(kms.EnvKESClientCert, ""), env.Get(kms.EnvKESClientKey, ""), loadX509KeyPair)
-			if err != nil {
-				logger.Fatal(err, "Failed to load KES client certificate")
-			}
-			certificate.Watch(context.Background(), 15*time.Minute, syscall.SIGHUP)
-			certificate.Notify(reloadCertEvents)
-
-			kmsConf = kms.Config{
-				Endpoints:        endpoints,
-				Enclave:          env.Get(kms.EnvKESEnclave, ""),
-				DefaultKeyID:     env.Get(kms.EnvKESKeyName, ""),
-				Certificate:      certificate,
-				ReloadCertEvents: reloadCertEvents,
-				RootCAs:          rootCAs,
-			}
-		}
-
-		KMS, err := kms.NewWithConfig(kmsConf)
-		if err != nil {
-			logger.Fatal(err, "Unable to initialize a connection to KES as specified by the shell environment")
-		}
-		// We check that the default key ID exists or try to create it otherwise.
-		// This implicitly checks that we can communicate to KES. We don't treat
-		// a policy error as failure condition since MinIO may not have the permission
-		// to create keys - just to generate/decrypt data encryption keys.
-		if err = KMS.CreateKey(context.Background(), env.Get(kms.EnvKESKeyName, "")); err != nil && !errors.Is(err, kes.ErrKeyExists) && !errors.Is(err, kes.ErrNotAllowed) {
-			logger.Fatal(err, "Unable to initialize a connection to KES as specified by the shell environment")
-		}
-		GlobalKMS = KMS
+	if _, err = KMS.GenerateKey(GlobalContext, &kms.GenerateKeyRequest{}); errors.Is(err, kms.ErrKeyNotFound) {
+		err = KMS.CreateKey(GlobalContext, &kms.CreateKeyRequest{Name: KMS.DefaultKey})
 	}
+	if err != nil && !errors.Is(err, kms.ErrKeyExists) && !errors.Is(err, kms.ErrPermission) {
+		logger.Fatal(err, "Failed to connect to KMS")
+	}
+	GlobalKMS = KMS
 }
 
 func getTLSConfig() (x509Certs []*x509.Certificate, manager *certs.Manager, secureConn bool, err error) {
@@ -1025,7 +985,7 @@ func getTLSConfig() (x509Certs []*x509.Certificate, manager *certs.Manager, secu
 		}
 		if err = manager.AddCertificate(certFile, keyFile); err != nil {
 			err = fmt.Errorf("Unable to load TLS certificate '%s,%s': %w", certFile, keyFile, err)
-			logger.LogIf(GlobalContext, err, logger.Minio)
+			bootLogIf(GlobalContext, err, logger.ErrorKind)
 		}
 	}
 	secureConn = true

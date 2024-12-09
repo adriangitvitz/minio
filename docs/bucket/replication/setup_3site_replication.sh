@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+echo "Running $0"
+
 if [ -n "$TEST_DEBUG" ]; then
 	set -x
 fi
@@ -24,6 +26,9 @@ catch() {
 	rm -rf /tmp/multisitea
 	rm -rf /tmp/multisiteb
 	rm -rf /tmp/multisitec
+	if [ $# -ne 0 ]; then
+		exit $#
+	fi
 }
 
 catch
@@ -41,12 +46,13 @@ unset MINIO_KMS_KES_KEY_FILE
 unset MINIO_KMS_KES_ENDPOINT
 unset MINIO_KMS_KES_KEY_NAME
 
-go install github.com/minio/minio/docs/debugging/s3-check-md5@latest
+go install -v github.com/minio/mc@master
+cp -a $(go env GOPATH)/bin/mc ./mc
 
-wget -O mc https://dl.minio.io/client/mc/release/linux-amd64/mc &&
-	chmod +x mc
-wget -O mc.RELEASE.2021-03-12T03-36-59Z https://dl.minio.io/client/mc/release/linux-amd64/archive/mc.RELEASE.2021-03-12T03-36-59Z &&
-	chmod +x mc.RELEASE.2021-03-12T03-36-59Z
+if [ ! -f mc.RELEASE.2021-03-12T03-36-59Z ]; then
+	wget -q -O mc.RELEASE.2021-03-12T03-36-59Z https://dl.minio.io/client/mc/release/linux-amd64/archive/mc.RELEASE.2021-03-12T03-36-59Z &&
+		chmod +x mc.RELEASE.2021-03-12T03-36-59Z
+fi
 
 minio server --address 127.0.0.1:9001 "http://127.0.0.1:9001/tmp/multisitea/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9002/tmp/multisitea/data/disterasure/xl{5...8}" >/tmp/sitea_1.log 2>&1 &
@@ -63,11 +69,13 @@ minio server --address 127.0.0.1:9005 "http://127.0.0.1:9005/tmp/multisitec/data
 minio server --address 127.0.0.1:9006 "http://127.0.0.1:9005/tmp/multisitec/data/disterasure/xl{1...4}" \
 	"http://127.0.0.1:9006/tmp/multisitec/data/disterasure/xl{5...8}" >/tmp/sitec_2.log 2>&1 &
 
-sleep 30
-
 export MC_HOST_sitea=http://minio:minio123@127.0.0.1:9001
 export MC_HOST_siteb=http://minio:minio123@127.0.0.1:9004
 export MC_HOST_sitec=http://minio:minio123@127.0.0.1:9006
+
+./mc ready sitea
+./mc ready siteb
+./mc ready sitec
 
 ./mc mb sitea/bucket
 ./mc version enable sitea/bucket
@@ -158,7 +166,7 @@ echo "Set default governance retention 30d"
 ./mc retention set --default governance 30d sitea/olockbucket
 
 echo "Copying data to source sitea/bucket"
-./mc cp --encrypt "sitea/" --quiet /etc/hosts sitea/bucket
+./mc cp --enc-s3 "sitea/" --quiet /etc/hosts sitea/bucket
 sleep 1
 
 echo "Copying data to source sitea/olockbucket"
@@ -166,20 +174,20 @@ echo "Copying data to source sitea/olockbucket"
 sleep 1
 
 echo "Verifying the metadata difference between source and target"
-if diff -pruN <(./mc stat --json sitea/bucket/hosts | jq .) <(./mc stat --json siteb/bucket/hosts | jq .) | grep -q 'COMPLETED\|REPLICA'; then
+if diff -pruN <(./mc stat --no-list --json sitea/bucket/hosts | jq .) <(./mc stat --no-list --json siteb/bucket/hosts | jq .) | grep -q 'COMPLETED\|REPLICA'; then
 	echo "verified sitea-> COMPLETED, siteb-> REPLICA"
 fi
 
-if diff -pruN <(./mc stat --json sitea/bucket/hosts | jq .) <(./mc stat --json sitec/bucket/hosts | jq .) | grep -q 'COMPLETED\|REPLICA'; then
+if diff -pruN <(./mc stat --no-list --json sitea/bucket/hosts | jq .) <(./mc stat --no-list --json sitec/bucket/hosts | jq .) | grep -q 'COMPLETED\|REPLICA'; then
 	echo "verified sitea-> COMPLETED, sitec-> REPLICA"
 fi
 
 echo "Verifying the metadata difference between source and target"
-if diff -pruN <(./mc stat --json sitea/olockbucket/hosts | jq .) <(./mc stat --json siteb/olockbucket/hosts | jq .) | grep -q 'COMPLETED\|REPLICA'; then
+if diff -pruN <(./mc stat --no-list --json sitea/olockbucket/hosts | jq .) <(./mc stat --no-list --json siteb/olockbucket/hosts | jq .) | grep -q 'COMPLETED\|REPLICA'; then
 	echo "verified sitea-> COMPLETED, siteb-> REPLICA"
 fi
 
-if diff -pruN <(./mc stat --json sitea/olockbucket/hosts | jq .) <(./mc stat --json sitec/olockbucket/hosts | jq .) | grep -q 'COMPLETED\|REPLICA'; then
+if diff -pruN <(./mc stat --no-list --json sitea/olockbucket/hosts | jq .) <(./mc stat --no-list --json sitec/olockbucket/hosts | jq .) | grep -q 'COMPLETED\|REPLICA'; then
 	echo "verified sitea-> COMPLETED, sitec-> REPLICA"
 fi
 
@@ -189,24 +197,48 @@ head -c 221227088 </dev/urandom >200M
 ./mc.RELEASE.2021-03-12T03-36-59Z cp --config-dir ~/.mc --encrypt "sitea" --quiet 200M "sitea/bucket/200M-enc-v1"
 ./mc.RELEASE.2021-03-12T03-36-59Z cp --config-dir ~/.mc --quiet 200M "sitea/bucket/200M-v1"
 
-./mc cp --encrypt "sitea" --quiet 200M "sitea/bucket/200M-enc-v2"
+./mc cp --enc-s3 "sitea" --quiet 200M "sitea/bucket/200M-enc-v2"
 ./mc cp --quiet 200M "sitea/bucket/200M-v2"
 
 sleep 10
 
 echo "Verifying ETag for all objects"
-s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9001/ -bucket bucket
-s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9002/ -bucket bucket
-s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9003/ -bucket bucket
-s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9004/ -bucket bucket
-s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9005/ -bucket bucket
-s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9006/ -bucket bucket
+./s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9001/ -bucket bucket
+./s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9002/ -bucket bucket
+./s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9003/ -bucket bucket
+./s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9004/ -bucket bucket
+./s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9005/ -bucket bucket
+./s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9006/ -bucket bucket
 
-s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9001/ -bucket olockbucket
-s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9002/ -bucket olockbucket
-s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9003/ -bucket olockbucket
-s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9004/ -bucket olockbucket
-s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9005/ -bucket olockbucket
-s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9006/ -bucket olockbucket
+./s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9001/ -bucket olockbucket
+./s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9002/ -bucket olockbucket
+./s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9003/ -bucket olockbucket
+./s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9004/ -bucket olockbucket
+./s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9005/ -bucket olockbucket
+./s3-check-md5 -versions -access-key minio -secret-key minio123 -endpoint http://127.0.0.1:9006/ -bucket olockbucket
+
+# additional tests for encryption object alignment
+go install -v github.com/minio/multipart-debug@latest
+
+upload_id=$(multipart-debug --endpoint 127.0.0.1:9001 --accesskey minio --secretkey minio123 multipart new --bucket bucket --object new-test-encrypted-object --encrypt)
+
+dd if=/dev/urandom bs=1 count=7048531 of=/tmp/7048531.txt
+dd if=/dev/urandom bs=1 count=2847391 of=/tmp/2847391.txt
+
+sudo apt install jq -y
+
+etag_1=$(multipart-debug --endpoint 127.0.0.1:9002 --accesskey minio --secretkey minio123 multipart upload --bucket bucket --object new-test-encrypted-object --uploadid ${upload_id} --file /tmp/7048531.txt --number 1 | jq -r .ETag)
+etag_2=$(multipart-debug --endpoint 127.0.0.1:9001 --accesskey minio --secretkey minio123 multipart upload --bucket bucket --object new-test-encrypted-object --uploadid ${upload_id} --file /tmp/2847391.txt --number 2 | jq -r .ETag)
+multipart-debug --endpoint 127.0.0.1:9002 --accesskey minio --secretkey minio123 multipart complete --bucket bucket --object new-test-encrypted-object --uploadid ${upload_id} 1.${etag_1} 2.${etag_2}
+
+sleep 10
+
+./mc stat --no-list sitea/bucket/new-test-encrypted-object
+./mc stat --no-list siteb/bucket/new-test-encrypted-object
+./mc stat --no-list sitec/bucket/new-test-encrypted-object
+
+./mc ls -r sitea/bucket/
+./mc ls -r siteb/bucket/
+./mc ls -r sitec/bucket/
 
 catch

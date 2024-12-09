@@ -152,7 +152,7 @@ func testPostPolicyReservedBucketExploit(obj ObjectLayer, instanceType string, d
 	req.Header.Set("Content-Type", contentTypeHdr)
 	req.Header.Set("User-Agent", "Mozilla")
 
-	// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic ofthe handler.
+	// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 	// Call the ServeHTTP to execute the handler.
 	apiRouter.ServeHTTP(rec, req)
 
@@ -164,7 +164,7 @@ func testPostPolicyReservedBucketExploit(obj ObjectLayer, instanceType string, d
 	z := obj.(*erasureServerPools)
 	xl := z.serverPools[0].sets[0]
 	erasureDisks := xl.getDisks()
-	parts, errs := readAllFileInfo(ctx, erasureDisks, bucketName, objectName+"/upload.txt", "", false, false)
+	parts, errs := readAllFileInfo(ctx, erasureDisks, "", bucketName, objectName+"/upload.txt", "", false, false)
 	for i := range parts {
 		if errs[i] == nil {
 			if parts[i].Name == objectName+"/upload.txt" {
@@ -210,26 +210,31 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 	// Test cases for signature-V2.
 	testCasesV2 := []struct {
 		expectedStatus int
-		accessKey      string
 		secretKey      string
+		formData       map[string]string
 	}{
-		{http.StatusForbidden, "invalidaccesskey", credentials.SecretKey},
-		{http.StatusForbidden, credentials.AccessKey, "invalidsecretkey"},
-		{http.StatusNoContent, credentials.AccessKey, credentials.SecretKey},
+		{http.StatusForbidden, credentials.SecretKey, map[string]string{"AWSAccessKeyId": "invalidaccesskey"}},
+		{http.StatusForbidden, "invalidsecretkey", map[string]string{"AWSAccessKeyId": credentials.AccessKey}},
+		{http.StatusNoContent, credentials.SecretKey, map[string]string{"AWSAccessKeyId": credentials.AccessKey}},
+		{http.StatusForbidden, credentials.SecretKey, map[string]string{"Awsaccesskeyid": "invalidaccesskey"}},
+		{http.StatusForbidden, "invalidsecretkey", map[string]string{"Awsaccesskeyid": credentials.AccessKey}},
+		{http.StatusNoContent, credentials.SecretKey, map[string]string{"Awsaccesskeyid": credentials.AccessKey}},
+		// Forbidden with key not in policy.conditions for signed requests V2.
+		{http.StatusForbidden, credentials.SecretKey, map[string]string{"Awsaccesskeyid": credentials.AccessKey, "AnotherKey": "AnotherContent"}},
 	}
 
 	for i, test := range testCasesV2 {
 		// initialize HTTP NewRecorder, this records any mutations to response writer inside the handler.
 		rec := httptest.NewRecorder()
-		req, perr := newPostRequestV2("", bucketName, "testobject", test.accessKey, test.secretKey)
+		req, perr := newPostRequestV2("", bucketName, "testobject", test.secretKey, test.formData)
 		if perr != nil {
 			t.Fatalf("Test %d: %s: Failed to create HTTP request for PostPolicyHandler: <ERROR> %v", i+1, instanceType, perr)
 		}
-		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic ofthe handler.
+		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 		// Call the ServeHTTP to execute the handler.
 		apiRouter.ServeHTTP(rec, req)
 		if rec.Code != test.expectedStatus {
-			t.Fatalf("Test %d: %s: Expected the response status to be `%d`, but instead found `%d`", i+1, instanceType, test.expectedStatus, rec.Code)
+			t.Fatalf("Test %d: %s: Expected the response status to be `%d`, but instead found `%d`, Resp: %s", i+1, instanceType, test.expectedStatus, rec.Code, rec.Body)
 		}
 	}
 
@@ -284,7 +289,7 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 			// Change the request body.
 			req.Body = io.NopCloser(bytes.NewReader([]byte("Hello,")))
 		}
-		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic ofthe handler.
+		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 		// Call the ServeHTTP to execute the handler.
 		apiRouter.ServeHTTP(rec, req)
 		if rec.Code != testCase.expectedRespStatus {
@@ -415,7 +420,7 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 		if perr != nil {
 			t.Fatalf("Test %d: %s: Failed to create HTTP request for PostPolicyHandler: <ERROR> %v", i+1, instanceType, perr)
 		}
-		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic ofthe handler.
+		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 		// Call the ServeHTTP to execute the handler.
 		apiRouter.ServeHTTP(rec, req)
 		if rec.Code != testCase.expectedRespStatus {
@@ -487,7 +492,7 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 		if perr != nil {
 			t.Fatalf("Test %d: %s: Failed to create HTTP request for PostPolicyHandler: <ERROR> %v", i+1, instanceType, perr)
 		}
-		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic ofthe handler.
+		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 		// Call the ServeHTTP to execute the handler.
 		apiRouter.ServeHTTP(rec, req)
 		if rec.Code != testCase.expectedRespStatus {
@@ -556,7 +561,7 @@ func testPostPolicyBucketHandlerRedirect(obj ObjectLayer, instanceType string, t
 	if perr != nil {
 		t.Fatalf("%s: Failed to create HTTP request for PostPolicyHandler: <ERROR> %v", instanceType, perr)
 	}
-	// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic ofthe handler.
+	// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic of the handler.
 	// Call the ServeHTTP to execute the handler.
 	apiRouter.ServeHTTP(rec, req)
 
@@ -593,7 +598,7 @@ func postPresignSignatureV4(policyBase64 string, t time.Time, secretAccessKey, l
 	return signature
 }
 
-func newPostRequestV2(endPoint, bucketName, objectName string, accessKey, secretKey string) (*http.Request, error) {
+func newPostRequestV2(endPoint, bucketName, objectName string, secretKey string, formInputData map[string]string) (*http.Request, error) {
 	// Expire the request five minutes from now.
 	expirationTime := UTCNow().Add(time.Minute * 5)
 	// Create a new post policy.
@@ -605,13 +610,14 @@ func newPostRequestV2(endPoint, bucketName, objectName string, accessKey, secret
 	signature := calculateSignatureV2(encodedPolicy, secretKey)
 
 	formData := map[string]string{
-		"AWSAccessKeyId":              accessKey,
-		"bucket":                      bucketName,
-		"key":                         objectName + "/${filename}",
-		"policy":                      encodedPolicy,
-		"signature":                   signature,
-		"X-Amz-Ignore-signature":      "",
-		"X-Amz-Ignore-AWSAccessKeyId": "",
+		"bucket":    bucketName,
+		"key":       objectName + "/${filename}",
+		"policy":    encodedPolicy,
+		"signature": signature,
+	}
+
+	for key, value := range formInputData {
+		formData[key] = value
 	}
 
 	// Create the multipart form.

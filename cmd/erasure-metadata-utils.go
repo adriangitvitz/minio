@@ -19,37 +19,80 @@ package cmd
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
-	"fmt"
 	"hash/crc32"
-	"io"
 
-	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/sync/errgroup"
+	"github.com/minio/pkg/v3/sync/errgroup"
 )
 
+// counterMap type adds GetValueWithQuorum method to a map[T]int used to count occurrences of values of type T.
+type counterMap[T comparable] map[T]int
+
+// GetValueWithQuorum returns the first key which occurs >= quorum number of times.
+func (c counterMap[T]) GetValueWithQuorum(quorum int) (T, bool) {
+	var zero T
+	for x, count := range c {
+		if count >= quorum {
+			return x, true
+		}
+	}
+	return zero, false
+}
+
 // figure out the most commonVersions across disk that satisfies
-// the 'writeQuorum' this function returns '0' if quorum cannot
+// the 'writeQuorum' this function returns "" if quorum cannot
 // be achieved and disks have too many inconsistent versions.
-func reduceCommonVersions(diskVersions []uint64, writeQuorum int) (commonVersions uint64) {
+func reduceCommonVersions(diskVersions [][]byte, writeQuorum int) (versions []byte) {
 	diskVersionsCount := make(map[uint64]int)
 	for _, versions := range diskVersions {
-		diskVersionsCount[versions]++
+		if len(versions) > 0 {
+			diskVersionsCount[binary.BigEndian.Uint64(versions)]++
+		}
 	}
 
-	max := 0
+	var commonVersions uint64
+	maxCnt := 0
 	for versions, count := range diskVersionsCount {
-		if max < count {
-			max = count
+		if maxCnt < count {
+			maxCnt = count
 			commonVersions = versions
 		}
 	}
 
-	if max >= writeQuorum {
-		return commonVersions
+	if maxCnt >= writeQuorum {
+		for _, versions := range diskVersions {
+			if binary.BigEndian.Uint64(versions) == commonVersions {
+				return versions
+			}
+		}
 	}
 
-	return 0
+	return []byte{}
+}
+
+// figure out the most commonVersions across disk that satisfies
+// the 'writeQuorum' this function returns '0' if quorum cannot
+// be achieved and disks have too many inconsistent versions.
+func reduceCommonDataDir(dataDirs []string, writeQuorum int) (dataDir string) {
+	dataDirsCount := make(map[string]int)
+	for _, ddir := range dataDirs {
+		dataDirsCount[ddir]++
+	}
+
+	maxCnt := 0
+	for ddir, count := range dataDirsCount {
+		if maxCnt < count {
+			maxCnt = count
+			dataDir = ddir
+		}
+	}
+
+	if maxCnt >= writeQuorum {
+		return dataDir
+	}
+
+	return ""
 }
 
 // Returns number of errors that occurred the most (incl. nil) and the
@@ -64,7 +107,7 @@ func reduceErrs(errs []error, ignoredErrs []error) (maxCount int, maxErr error) 
 		if IsErrIgnored(err, ignoredErrs...) {
 			continue
 		}
-		// Errors due to context cancelation may be wrapped - group them by context.Canceled.
+		// Errors due to context cancellation may be wrapped - group them by context.Canceled.
 		if errors.Is(err, context.Canceled) {
 			errorCounts[context.Canceled]++
 			continue
@@ -72,20 +115,20 @@ func reduceErrs(errs []error, ignoredErrs []error) (maxCount int, maxErr error) 
 		errorCounts[err]++
 	}
 
-	max := 0
+	maxCnt := 0
 	for err, count := range errorCounts {
 		switch {
-		case max < count:
-			max = count
+		case maxCnt < count:
+			maxCnt = count
 			maxErr = err
 
 		// Prefer `nil` over other error values with the same
 		// number of occurrences.
-		case max == count && err == nil:
+		case maxCnt == count && err == nil:
 			maxErr = err
 		}
 	}
-	return max, maxErr
+	return maxCnt, maxErr
 }
 
 // reduceQuorumErrs behaves like reduceErrs by only for returning
@@ -148,29 +191,9 @@ func hashOrder(key string, cardinality int) []int {
 	return nums
 }
 
-var readFileInfoIgnoredErrs = append(objectOpIgnoredErrs,
-	errFileNotFound,
-	errVolumeNotFound,
-	errFileVersionNotFound,
-	io.ErrUnexpectedEOF, // some times we would read without locks, ignore these errors
-	io.EOF,              // some times we would read without locks, ignore these errors
-)
-
-func readFileInfo(ctx context.Context, disk StorageAPI, bucket, object, versionID string, opts ReadOptions) (FileInfo, error) {
-	fi, err := disk.ReadVersion(ctx, bucket, object, versionID, opts)
-
-	if err != nil && !IsErr(err, readFileInfoIgnoredErrs...) {
-		logger.LogOnceIf(ctx, fmt.Errorf("Drive %s, path (%s/%s) returned an error (%w)",
-			disk.String(), bucket, object, err),
-			disk.String())
-	}
-
-	return fi, err
-}
-
 // Reads all `xl.meta` metadata as a FileInfo slice.
 // Returns error slice indicating the failed metadata reads.
-func readAllFileInfo(ctx context.Context, disks []StorageAPI, bucket, object, versionID string, readData, healing bool) ([]FileInfo, []error) {
+func readAllFileInfo(ctx context.Context, disks []StorageAPI, origbucket string, bucket, object, versionID string, readData, healing bool) ([]FileInfo, []error) {
 	metadataArray := make([]FileInfo, len(disks))
 
 	opts := ReadOptions{
@@ -186,7 +209,7 @@ func readAllFileInfo(ctx context.Context, disks []StorageAPI, bucket, object, ve
 			if disks[index] == nil {
 				return errDiskNotFound
 			}
-			metadataArray[index], err = readFileInfo(ctx, disks[index], bucket, object, versionID, opts)
+			metadataArray[index], err = disks[index].ReadVersion(ctx, origbucket, bucket, object, versionID, opts)
 			return err
 		}, index)
 	}
@@ -306,7 +329,7 @@ func shuffleDisks(disks []StorageAPI, distribution []int) (shuffledDisks []Stora
 // the corresponding error in errs slice is not nil
 func evalDisks(disks []StorageAPI, errs []error) []StorageAPI {
 	if len(errs) != len(disks) {
-		logger.LogIf(GlobalContext, errors.New("unexpected drives/errors slice length"))
+		bugLogIf(GlobalContext, errors.New("unexpected drives/errors slice length"))
 		return nil
 	}
 	newDisks := make([]StorageAPI, len(disks))
@@ -330,15 +353,12 @@ var (
 // returns error if totalSize is -1, partSize is 0, partIndex is 0.
 func calculatePartSizeFromIdx(ctx context.Context, totalSize int64, partSize int64, partIndex int) (currPartSize int64, err error) {
 	if totalSize < -1 {
-		logger.LogIf(ctx, errInvalidArgument)
 		return 0, errInvalidArgument
 	}
 	if partSize == 0 {
-		logger.LogIf(ctx, errPartSizeZero)
 		return 0, errPartSizeZero
 	}
 	if partIndex < 1 {
-		logger.LogIf(ctx, errPartSizeIndex)
 		return 0, errPartSizeIndex
 	}
 	if totalSize == -1 {

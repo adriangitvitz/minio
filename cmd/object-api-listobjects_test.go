@@ -155,16 +155,21 @@ func testListObjectsVersionedFolders(obj ObjectLayer, instanceType string, t1 Te
 	for i, testCase := range testCases {
 		testCase := testCase
 		t.Run(fmt.Sprintf("%s-Test%d", instanceType, i+1), func(t *testing.T) {
-			t.Log("ListObjects, bucket:", testCase.bucketName, "prefix:",
-				testCase.prefix, "marker:", testCase.marker, "delimiter:",
-				testCase.delimiter, "maxkeys:", testCase.maxKeys)
 			var err error
 			var resultL ListObjectsInfo
 			var resultV ListObjectVersionsInfo
 			if testCase.versioned {
+				t.Log("ListObjectVersions, bucket:", testCase.bucketName, "prefix:",
+					testCase.prefix, "marker:", testCase.marker, "delimiter:",
+					testCase.delimiter, "maxkeys:", testCase.maxKeys)
+
 				resultV, err = obj.ListObjectVersions(context.Background(), testCase.bucketName,
 					testCase.prefix, testCase.marker, "", testCase.delimiter, testCase.maxKeys)
 			} else {
+				t.Log("ListObjects, bucket:", testCase.bucketName, "prefix:",
+					testCase.prefix, "marker:", testCase.marker, "delimiter:",
+					testCase.delimiter, "maxkeys:", testCase.maxKeys)
+
 				resultL, err = obj.ListObjects(context.Background(), testCase.bucketName,
 					testCase.prefix, testCase.marker, testCase.delimiter, testCase.maxKeys)
 			}
@@ -819,16 +824,14 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		shouldPass bool
 	}{
 		// Test cases with invalid bucket names ( Test number 1-4 ).
-		{".test", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: ".test"}, false},
-		{"Test", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "Test"}, false},
-		{"---", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "---"}, false},
-		{"ad", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "ad"}, false},
-		// Using an existing file for bucket name, but its not a directory (5).
-		{"simple-file.txt", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "simple-file.txt"}, false},
-		// Valid bucket names, but they donot exist (6-8).
-		{"volatile-bucket-1", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-1"}, false},
-		{"volatile-bucket-2", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-2"}, false},
-		{"volatile-bucket-3", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-3"}, false},
+		{".test", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: ".test"}, false},
+		{"Test", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "Test"}, false},
+		{"---", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "---"}, false},
+		{"ad", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "ad"}, false},
+		// Valid bucket names, but they do not exist (6-8).
+		{"volatile-bucket-1", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-1"}, false},
+		{"volatile-bucket-2", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-2"}, false},
+		{"volatile-bucket-3", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-3"}, false},
 		// If marker is *after* the last possible object from the prefix it should return an empty list.
 		{"test-bucket-list-object", "Asia", "europe-object", "", 0, ListObjectsInfo{}, nil, true},
 		// If the marker is *before* the first possible object from the prefix it should return the first object.
@@ -875,7 +878,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		// Marker being set to a value which is lesser than and all object names when sorted (37).
 		// Expected to send all the objects in the bucket in this case.
 		{"test-bucket-list-object", "", "Abc", "", 10, resultCases[14], nil, true},
-		// Marker is to a hierarhical value (38-39).
+		// Marker is to a hierarchical value (38-39).
 		{"test-bucket-list-object", "", "Asia/India/India-summer-photos-1", "", 10, resultCases[15], nil, true},
 		{"test-bucket-list-object", "", "Asia/India/Karnataka/Bangalore/Koramangala/pics", "", 10, resultCases[16], nil, true},
 		// Testing with marker and truncation, but no prefix (40-42).
@@ -906,7 +909,7 @@ func _testListObjects(obj ObjectLayer, instanceType string, t1 TestErrHandler, v
 		{"test-bucket-list-object", "Asia", "", SlashSeparator, 10, resultCases[25], nil, true},
 		{"test-bucket-list-object", "new", "", SlashSeparator, 10, resultCases[26], nil, true},
 		{"test-bucket-list-object", "Asia/India/", "", SlashSeparator, 10, resultCases[27], nil, true},
-		// Test with marker set as hierarhical value and with delimiter. (58-59)
+		// Test with marker set as hierarchical value and with delimiter. (58-59)
 		{"test-bucket-list-object", "", "Asia/India/India-summer-photos-1", SlashSeparator, 10, resultCases[28], nil, true},
 		{"test-bucket-list-object", "", "Asia/India/Karnataka/Bangalore/Koramangala/pics", SlashSeparator, 10, resultCases[29], nil, true},
 		// Test with prefix and delimiter set to '/'. (60)
@@ -1564,16 +1567,14 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		shouldPass bool
 	}{
 		// Test cases with invalid bucket names ( Test number 1-4).
-		{".test", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: ".test"}, false},
-		{"Test", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "Test"}, false},
-		{"---", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "---"}, false},
-		{"ad", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "ad"}, false},
-		// Using an existing file for bucket name, but its not a directory (5).
-		{"simple-file.txt", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "simple-file.txt"}, false},
-		// Valid bucket names, but they donot exist (6-8).
-		{"volatile-bucket-1", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-1"}, false},
-		{"volatile-bucket-2", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-2"}, false},
-		{"volatile-bucket-3", "", "", "", 0, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-3"}, false},
+		{".test", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: ".test"}, false},
+		{"Test", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "Test"}, false},
+		{"---", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "---"}, false},
+		{"ad", "", "", "", 0, ListObjectsInfo{}, BucketNameInvalid{Bucket: "ad"}, false},
+		// Valid bucket names, but they do not exist (6-8).
+		{"volatile-bucket-1", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-1"}, false},
+		{"volatile-bucket-2", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-2"}, false},
+		{"volatile-bucket-3", "", "", "", 1000, ListObjectsInfo{}, BucketNotFound{Bucket: "volatile-bucket-3"}, false},
 		// If marker is *after* the last possible object from the prefix it should return an empty list.
 		{"test-bucket-list-object", "Asia", "europe-object", "", 0, ListObjectsInfo{}, nil, true},
 		// Setting a non-existing directory to be prefix (10-11).
@@ -1617,7 +1618,7 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		// Marker being set to a value which is lesser than and all object names when sorted (35).
 		// Expected to send all the objects in the bucket in this case.
 		{"test-bucket-list-object", "", "Abc", "", 10, resultCases[14], nil, true},
-		// Marker is to a hierarhical value (36-37).
+		// Marker is to a hierarchical value (36-37).
 		{"test-bucket-list-object", "", "Asia/India/India-summer-photos-1", "", 10, resultCases[15], nil, true},
 		{"test-bucket-list-object", "", "Asia/India/Karnataka/Bangalore/Koramangala/pics", "", 10, resultCases[16], nil, true},
 		// Testing with marker and truncation, but no prefix (38-40).
@@ -1648,7 +1649,7 @@ func testListObjectVersions(obj ObjectLayer, instanceType string, t1 TestErrHand
 		{"test-bucket-list-object", "Asia", "", SlashSeparator, 10, resultCases[25], nil, true},
 		{"test-bucket-list-object", "new", "", SlashSeparator, 10, resultCases[26], nil, true},
 		{"test-bucket-list-object", "Asia/India/", "", SlashSeparator, 10, resultCases[27], nil, true},
-		// Test with marker set as hierarhical value and with delimiter. (56-57)
+		// Test with marker set as hierarchical value and with delimiter. (56-57)
 		{"test-bucket-list-object", "", "Asia/India/India-summer-photos-1", SlashSeparator, 10, resultCases[28], nil, true},
 		{"test-bucket-list-object", "", "Asia/India/Karnataka/Bangalore/Koramangala/pics", SlashSeparator, 10, resultCases[29], nil, true},
 		// Test with prefix and delimiter set to '/'. (58)

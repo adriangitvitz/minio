@@ -19,9 +19,6 @@ package cmd
 
 import (
 	"net/http"
-	"reflect"
-	"runtime"
-	"strings"
 
 	"github.com/klauspost/compress/gzhttp"
 	"github.com/klauspost/compress/gzip"
@@ -63,18 +60,10 @@ const (
 	noObjLayerFlag
 )
 
-// Has checks if the the given flag is enabled in `h`.
+// Has checks if the given flag is enabled in `h`.
 func (h hFlag) Has(flag hFlag) bool {
 	// Use bitwise-AND and check if the result is non-zero.
 	return h&flag != 0
-}
-
-func getHandlerName(f http.HandlerFunc) string {
-	name := runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name()
-	name = strings.TrimPrefix(name, "github.com/minio/minio/cmd.adminAPIHandlers.")
-	name = strings.TrimSuffix(name, "Handler-fm")
-	name = strings.TrimSuffix(name, "-fm")
-	return name
 }
 
 // adminMiddleware performs some common admin handler functionality for all
@@ -86,9 +75,13 @@ func getHandlerName(f http.HandlerFunc) string {
 //
 // - sets up call to send AuditLog
 //
-// Note that, while this is a middleware function (i.e. it takes a handler
-// function and returns one), due to flags being passed based on required
-// conditions, it is done per-"handler function registration" in the router.
+// While this is a middleware function (i.e. it takes a handler function and
+// returns one), due to flags being passed based on required conditions, it is
+// done per-"handler function registration" in the router.
+//
+// The passed in handler function must be a method of `adminAPIHandlers` for the
+// name displayed in logs and trace to be accurate. The name is extracted via
+// reflection.
 //
 // When no flags are passed, gzip compression, http tracing of headers and
 // checking of object layer availability are all enabled. Use flags to modify
@@ -100,10 +93,8 @@ func adminMiddleware(f http.HandlerFunc, flags ...hFlag) http.HandlerFunc {
 		handlerFlags |= flag
 	}
 
-	// Get name of the handler using reflection. NOTE: The passed in handler
-	// function must be a method of `adminAPIHandlers` for this extraction to
-	// work as expected.
-	handlerName := getHandlerName(f)
+	// Get name of the handler using reflection.
+	handlerName := getHandlerName(f, "adminAPIHandlers")
 
 	var handler http.HandlerFunc = func(w http.ResponseWriter, r *http.Request) {
 		// Update request context with `logger.ReqInfo`.
@@ -154,21 +145,28 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 	}
 
 	for _, adminVersion := range adminVersions {
-		// Restart and stop MinIO service.
+		// Restart and stop MinIO service type=2
+		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/service").HandlerFunc(adminMiddleware(adminAPI.ServiceV2Handler, traceAllFlag)).Queries("action", "{action:.*}", "type", "2")
+
+		// Deprecated: Restart and stop MinIO service.
 		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/service").HandlerFunc(adminMiddleware(adminAPI.ServiceHandler, traceAllFlag)).Queries("action", "{action:.*}")
-		// Update MinIO servers.
+
+		// Update all MinIO servers type=2
+		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/update").HandlerFunc(adminMiddleware(adminAPI.ServerUpdateV2Handler, traceAllFlag)).Queries("updateURL", "{updateURL:.*}", "type", "2")
+
+		// Deprecated: Update MinIO servers.
 		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/update").HandlerFunc(adminMiddleware(adminAPI.ServerUpdateHandler, traceAllFlag)).Queries("updateURL", "{updateURL:.*}")
 
 		// Info operations
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/info").HandlerFunc(adminMiddleware(adminAPI.ServerInfoHandler, traceAllFlag, noObjLayerFlag))
-		adminRouter.Methods(http.MethodGet, http.MethodPost).Path(adminVersion + "/inspect-data").HandlerFunc(adminMiddleware(adminAPI.InspectDataHandler, noGZFlag, traceAllFlag))
+		adminRouter.Methods(http.MethodGet, http.MethodPost).Path(adminVersion + "/inspect-data").HandlerFunc(adminMiddleware(adminAPI.InspectDataHandler, noGZFlag, traceHdrsS3HFlag))
 
 		// StorageInfo operations
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/storageinfo").HandlerFunc(adminMiddleware(adminAPI.StorageInfoHandler, traceAllFlag))
 		// DataUsageInfo operations
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/datausageinfo").HandlerFunc(adminMiddleware(adminAPI.DataUsageInfoHandler, traceAllFlag))
 		// Metrics operation
-		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/metrics").HandlerFunc(adminMiddleware(adminAPI.MetricsHandler, traceAllFlag))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/metrics").HandlerFunc(adminMiddleware(adminAPI.MetricsHandler, traceHdrsS3HFlag))
 
 		if globalIsDistErasure || globalIsErasure {
 			// Heal operations
@@ -195,9 +193,9 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		// Profiling operations - deprecated API
 		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/profiling/start").HandlerFunc(adminMiddleware(adminAPI.StartProfilingHandler, traceAllFlag, noObjLayerFlag)).
 			Queries("profilerType", "{profilerType:.*}")
-		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/profiling/download").HandlerFunc(adminMiddleware(adminAPI.DownloadProfilingHandler, traceAllFlag, noObjLayerFlag))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/profiling/download").HandlerFunc(adminMiddleware(adminAPI.DownloadProfilingHandler, traceHdrsS3HFlag, noObjLayerFlag))
 		// Profiling operations
-		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/profile").HandlerFunc(adminMiddleware(adminAPI.ProfileHandler, traceAllFlag, noObjLayerFlag))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/profile").HandlerFunc(adminMiddleware(adminAPI.ProfileHandler, traceHdrsS3HFlag, noObjLayerFlag))
 
 		// Config KV operations.
 		if enableConfigOps {
@@ -246,6 +244,9 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		// STS accounts ops
 		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/temporary-account-info").HandlerFunc(adminMiddleware(adminAPI.TemporaryAccountInfo)).Queries("accessKey", "{accessKey:.*}")
 
+		// Access key (service account/STS) operations
+		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/list-access-keys-bulk").HandlerFunc(adminMiddleware(adminAPI.ListAccessKeysBulk)).Queries("listType", "{listType:.*}")
+
 		// Info policy IAM latest
 		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/info-canned-policy").HandlerFunc(adminMiddleware(adminAPI.InfoCannedPolicy)).Queries("name", "{name:.*}")
 		// List policies latest
@@ -292,6 +293,7 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 
 		// Import IAM info
 		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/import-iam").HandlerFunc(adminMiddleware(adminAPI.ImportIAM, noGZFlag))
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/import-iam-v2").HandlerFunc(adminMiddleware(adminAPI.ImportIAMV2, noGZFlag))
 
 		// IDentity Provider configuration APIs
 		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/idp-config/{type}/{name}").HandlerFunc(adminMiddleware(adminAPI.AddIdentityProviderCfg))
@@ -299,6 +301,13 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/idp-config/{type}").HandlerFunc(adminMiddleware(adminAPI.ListIdentityProviderCfg))
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/idp-config/{type}/{name}").HandlerFunc(adminMiddleware(adminAPI.GetIdentityProviderCfg))
 		adminRouter.Methods(http.MethodDelete).Path(adminVersion + "/idp-config/{type}/{name}").HandlerFunc(adminMiddleware(adminAPI.DeleteIdentityProviderCfg))
+
+		// LDAP specific service accounts ops
+		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/idp/ldap/add-service-account").HandlerFunc(adminMiddleware(adminAPI.AddServiceAccountLDAP))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/idp/ldap/list-access-keys").
+			HandlerFunc(adminMiddleware(adminAPI.ListAccessKeysLDAP)).Queries("userDN", "{userDN:.*}", "listType", "{listType:.*}")
+		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/idp/ldap/list-access-keys-bulk").
+			HandlerFunc(adminMiddleware(adminAPI.ListAccessKeysLDAPBulk)).Queries("listType", "{listType:.*}")
 
 		// LDAP IAM operations
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/idp/ldap/policy-entities").HandlerFunc(adminMiddleware(adminAPI.ListLDAPPolicyMappingEntities))
@@ -335,6 +344,9 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/list-jobs").HandlerFunc(
 			adminMiddleware(adminAPI.ListBatchJobs))
+
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/status-job").HandlerFunc(
+			adminMiddleware(adminAPI.BatchJobStatus))
 
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/describe-job").HandlerFunc(
 			adminMiddleware(adminAPI.DescribeBatchJob))

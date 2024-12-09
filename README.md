@@ -93,7 +93,6 @@ The following table lists supported architectures. Replace the `wget` URL with t
 | 64-bit Intel/AMD               | <https://dl.min.io/server/minio/release/linux-amd64/minio>   |
 | 64-bit ARM                     | <https://dl.min.io/server/minio/release/linux-arm64/minio>   |
 | 64-bit PowerPC LE (ppc64le)    | <https://dl.min.io/server/minio/release/linux-ppc64le/minio> |
-| IBM Z-Series (S390X)           | <https://dl.min.io/server/minio/release/linux-s390x/minio>   |
 
 The MinIO deployment starts using default root credentials `minioadmin:minioadmin`. You can test the deployment using the MinIO Console, an embedded web-based object browser built into MinIO Server. Point a web browser running on the host machine to <http://127.0.0.1:9000> and log in with the root credentials. You can use the Browser to create buckets, upload objects, and browse the contents of the MinIO server.
 
@@ -123,7 +122,7 @@ You can also connect using any S3-compatible tool, such as the MinIO Client `mc`
 
 ## Install from Source
 
-Use the following commands to compile and run a standalone MinIO server from source. Source installation is only intended for developers and advanced users. If you do not have a working Golang environment, please follow [How to install Golang](https://golang.org/doc/install). Minimum version required is [go1.19](https://golang.org/dl/#stable)
+Use the following commands to compile and run a standalone MinIO server from source. Source installation is only intended for developers and advanced users. If you do not have a working Golang environment, please follow [How to install Golang](https://golang.org/doc/install). Minimum version required is [go1.21](https://golang.org/dl/#stable)
 
 ```sh
 go install github.com/minio/minio@latest
@@ -209,10 +208,6 @@ MinIO redirects browser access requests to the configured server port (i.e. `127
 For deployments behind a load balancer, proxy, or ingress rule where the MinIO host IP address or port is not public, use the `MINIO_BROWSER_REDIRECT_URL` environment variable to specify the external hostname for the redirect. The LB/Proxy must have rules for directing traffic to the Console port specifically.
 
 For example, consider a MinIO deployment behind a proxy `https://minio.example.net`, `https://console.minio.example.net` with rules for forwarding traffic on port :9000 and :9001 to MinIO and the MinIO Console respectively on the internal network. Set `MINIO_BROWSER_REDIRECT_URL` to `https://console.minio.example.net` to ensure the browser receives a valid reachable URL.
-
-Similarly, if your TLS certificates do not have the IP SAN for the MinIO server host, the MinIO Console may fail to validate the connection to the server. Use the `MINIO_SERVER_URL` environment variable  and specify the proxy-accessible hostname of the MinIO server to allow the Console to use the MinIO server API using the TLS certificate.
-
-For example: `export MINIO_SERVER_URL="https://minio.example.net"`
 
 | Dashboard                                                                                   | Creating a bucket                                                                           |
 | -------------                                                                               | -------------                                                                               |

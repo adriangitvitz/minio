@@ -26,9 +26,10 @@ import (
 	"sync"
 	"time"
 
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/mcontext"
-	"github.com/minio/pkg/v2/console"
-	"github.com/minio/pkg/v2/env"
+	"github.com/minio/pkg/v3/console"
+	"github.com/minio/pkg/v3/env"
 )
 
 // Indicator if logging is enabled.
@@ -253,7 +254,7 @@ func (dm *DRWMutex) lockBlocking(ctx context.Context, lockLossCallback func(), i
 				log("lockBlocking %s/%s for %#v: granted\n", id, source, dm.Names)
 
 				// Refresh lock continuously and cancel if there is no quorum in the lock anymore
-				dm.startContinousLockRefresh(lockLossCallback, id, source, quorum)
+				dm.startContinuousLockRefresh(lockLossCallback, id, source, quorum)
 
 				return locked
 			}
@@ -271,7 +272,7 @@ func (dm *DRWMutex) lockBlocking(ctx context.Context, lockLossCallback func(), i
 	}
 }
 
-func (dm *DRWMutex) startContinousLockRefresh(lockLossCallback func(), id, source string, quorum int) {
+func (dm *DRWMutex) startContinuousLockRefresh(lockLossCallback func(), id, source string, quorum int) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	dm.m.Lock()
@@ -406,7 +407,7 @@ func refreshLock(ctx context.Context, ds *Dsync, id, source string, quorum int) 
 	// We may have some unused results in ch, release them async.
 	go func() {
 		wg.Wait()
-		close(ch)
+		xioutil.SafeClose(ch)
 		for range ch {
 		}
 	}()
@@ -432,7 +433,7 @@ func lock(ctx context.Context, ds *Dsync, locks *[]string, id, source string, is
 		UID:       id,
 		Resources: names,
 		Source:    source,
-		Quorum:    quorum,
+		Quorum:    &quorum,
 	}
 
 	// Combined timeout for the lock attempt.
@@ -528,7 +529,7 @@ func lock(ctx context.Context, ds *Dsync, locks *[]string, id, source string, is
 	// We may have some unused results in ch, release them async.
 	go func() {
 		wg.Wait()
-		close(ch)
+		xioutil.SafeClose(ch)
 		for grantToBeReleased := range ch {
 			if grantToBeReleased.isLocked() {
 				// release abandoned lock
@@ -557,7 +558,7 @@ func checkFailedUnlocks(locks []string, tolerance int) bool {
 	// caller know that lock is not successfully released
 	// yet.
 	if len(locks)-tolerance == tolerance {
-		// Incase of split brain scenarios where
+		// In case of split brain scenarios where
 		// tolerance is exactly half of the len(*locks)
 		// then we need to make sure we have unlocked
 		// upto tolerance+1 - especially for RUnlock
@@ -638,9 +639,19 @@ func (dm *DRWMutex) Unlock(ctx context.Context) {
 	tolerance := len(restClnts) / 2
 
 	isReadLock := false
-	for !releaseAll(ctx, dm.clnt, tolerance, owner, &locks, isReadLock, restClnts, dm.Names...) {
-		time.Sleep(time.Duration(dm.rng.Float64() * float64(dm.lockRetryMinInterval)))
-	}
+	started := time.Now()
+	// Do async unlocking.
+	// This means unlock will no longer block on the network or missing quorum.
+	go func() {
+		ctx, done := context.WithTimeout(ctx, drwMutexUnlockCallTimeout)
+		defer done()
+		for !releaseAll(ctx, dm.clnt, tolerance, owner, &locks, isReadLock, restClnts, dm.Names...) {
+			time.Sleep(time.Duration(dm.rng.Float64() * float64(dm.lockRetryMinInterval)))
+			if time.Since(started) > dm.clnt.Timeouts.UnlockCall {
+				return
+			}
+		}
+	}()
 }
 
 // RUnlock releases a read lock held on dm.
@@ -677,11 +688,20 @@ func (dm *DRWMutex) RUnlock(ctx context.Context) {
 
 	// Tolerance is not set, defaults to half of the locker clients.
 	tolerance := len(restClnts) / 2
-
 	isReadLock := true
-	for !releaseAll(ctx, dm.clnt, tolerance, owner, &locks, isReadLock, restClnts, dm.Names...) {
-		time.Sleep(time.Duration(dm.rng.Float64() * float64(dm.lockRetryMinInterval)))
-	}
+	started := time.Now()
+	// Do async unlocking.
+	// This means unlock will no longer block on the network or missing quorum.
+	go func() {
+		for !releaseAll(ctx, dm.clnt, tolerance, owner, &locks, isReadLock, restClnts, dm.Names...) {
+			time.Sleep(time.Duration(dm.rng.Float64() * float64(dm.lockRetryMinInterval)))
+			// If we have been waiting for more than the force unlock timeout, return
+			// Remotes will have canceled due to the missing refreshes anyway.
+			if time.Since(started) > dm.clnt.Timeouts.UnlockCall {
+				return
+			}
+		}
+	}()
 }
 
 // sendRelease sends a release message to a node that previously granted a lock

@@ -75,6 +75,7 @@ const (
 	EnvMinIOPrometheusJobID       = "MINIO_PROMETHEUS_JOB_ID"
 	EnvMinIOPrometheusExtraLabels = "MINIO_PROMETHEUS_EXTRA_LABELS"
 	EnvMinIOPrometheusAuthToken   = "MINIO_PROMETHEUS_AUTH_TOKEN"
+	EnvConsoleDebugLogLevel       = "MINIO_CONSOLE_DEBUG_LOGLEVEL"
 
 	EnvUpdate = "MINIO_UPDATE"
 
@@ -82,6 +83,7 @@ const (
 	EnvWorm       = "MINIO_WORM"        // legacy
 	EnvRegion     = "MINIO_REGION"      // legacy
 	EnvRegionName = "MINIO_REGION_NAME" // legacy
+
 )
 
 // Expiration Token durations

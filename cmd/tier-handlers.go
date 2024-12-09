@@ -27,7 +27,7 @@ import (
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/config/storageclass"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 var (
@@ -140,6 +140,7 @@ func (api adminAPIHandlers) ListTierHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	w.Header().Set(tierCfgRefreshAtHdr, globalTierConfigMgr.refreshedAt().String())
 	writeSuccessResponseJSON(w, data)
 }
 
@@ -197,12 +198,14 @@ func (api adminAPIHandlers) RemoveTierHandler(w http.ResponseWriter, r *http.Req
 
 	vars := mux.Vars(r)
 	tier := vars["tier"]
+	force := r.Form.Get("force") == "true"
+
 	if err := globalTierConfigMgr.Reload(ctx, objAPI); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	if err := globalTierConfigMgr.Remove(ctx, tier); err != nil {
+	if err := globalTierConfigMgr.Remove(ctx, tier, force); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}

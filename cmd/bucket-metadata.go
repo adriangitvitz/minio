@@ -41,7 +41,7 @@ import (
 	"github.com/minio/minio/internal/fips"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 	"github.com/minio/sio"
 )
 
@@ -81,14 +81,19 @@ type BucketMetadata struct {
 	ReplicationConfigXML        []byte
 	BucketTargetsConfigJSON     []byte
 	BucketTargetsConfigMetaJSON []byte
-	PolicyConfigUpdatedAt       time.Time
-	ObjectLockConfigUpdatedAt   time.Time
-	EncryptionConfigUpdatedAt   time.Time
-	TaggingConfigUpdatedAt      time.Time
-	QuotaConfigUpdatedAt        time.Time
-	ReplicationConfigUpdatedAt  time.Time
-	VersioningConfigUpdatedAt   time.Time
-	LifecycleConfigUpdatedAt    time.Time
+
+	PolicyConfigUpdatedAt            time.Time
+	ObjectLockConfigUpdatedAt        time.Time
+	EncryptionConfigUpdatedAt        time.Time
+	TaggingConfigUpdatedAt           time.Time
+	QuotaConfigUpdatedAt             time.Time
+	ReplicationConfigUpdatedAt       time.Time
+	VersioningConfigUpdatedAt        time.Time
+	LifecycleConfigUpdatedAt         time.Time
+	NotificationConfigUpdatedAt      time.Time
+	BucketTargetsConfigUpdatedAt     time.Time
+	BucketTargetsConfigMetaUpdatedAt time.Time
+	// Add a new UpdatedAt field and update lastUpdate function
 
 	// Unexported fields. Must be updated atomically.
 	policyConfig           *policy.BucketPolicy
@@ -120,6 +125,46 @@ func newBucketMetadata(name string) BucketMetadata {
 	}
 }
 
+// Return the last update of this bucket metadata, which
+// means, the last update of any policy document.
+func (b BucketMetadata) lastUpdate() (t time.Time) {
+	if b.PolicyConfigUpdatedAt.After(t) {
+		t = b.PolicyConfigUpdatedAt
+	}
+	if b.ObjectLockConfigUpdatedAt.After(t) {
+		t = b.ObjectLockConfigUpdatedAt
+	}
+	if b.EncryptionConfigUpdatedAt.After(t) {
+		t = b.EncryptionConfigUpdatedAt
+	}
+	if b.TaggingConfigUpdatedAt.After(t) {
+		t = b.TaggingConfigUpdatedAt
+	}
+	if b.QuotaConfigUpdatedAt.After(t) {
+		t = b.QuotaConfigUpdatedAt
+	}
+	if b.ReplicationConfigUpdatedAt.After(t) {
+		t = b.ReplicationConfigUpdatedAt
+	}
+	if b.VersioningConfigUpdatedAt.After(t) {
+		t = b.VersioningConfigUpdatedAt
+	}
+	if b.LifecycleConfigUpdatedAt.After(t) {
+		t = b.LifecycleConfigUpdatedAt
+	}
+	if b.NotificationConfigUpdatedAt.After(t) {
+		t = b.NotificationConfigUpdatedAt
+	}
+	if b.BucketTargetsConfigUpdatedAt.After(t) {
+		t = b.BucketTargetsConfigUpdatedAt
+	}
+	if b.BucketTargetsConfigMetaUpdatedAt.After(t) {
+		t = b.BucketTargetsConfigMetaUpdatedAt
+	}
+
+	return
+}
+
 // Versioning returns true if versioning is enabled
 func (b BucketMetadata) Versioning() bool {
 	return b.LockEnabled || (b.versioningConfig != nil && b.versioningConfig.Enabled()) || (b.objectLockConfig != nil && b.objectLockConfig.Enabled())
@@ -145,7 +190,7 @@ func (b *BucketMetadata) SetCreatedAt(createdAt time.Time) {
 // If an error is returned the returned metadata will be default initialized.
 func readBucketMetadata(ctx context.Context, api ObjectLayer, name string) (BucketMetadata, error) {
 	if name == "" {
-		logger.LogIf(ctx, errors.New("bucket name cannot be empty"))
+		internalLogIf(ctx, errors.New("bucket name cannot be empty"), logger.WarningKind)
 		return BucketMetadata{}, errInvalidArgument
 	}
 	b := newBucketMetadata(name)
@@ -182,26 +227,34 @@ func loadBucketMetadataParse(ctx context.Context, objectAPI ObjectLayer, bucket 
 		b.defaultTimestamps()
 	}
 
-	configs, err := b.getAllLegacyConfigs(ctx, objectAPI)
-	if err != nil {
-		return b, err
+	// If bucket metadata is missing look for legacy files,
+	// since we only ever had b.Created as non-zero when
+	// migration was complete in 2020-May release. So this
+	// a check to avoid migrating for buckets that already
+	// have this field set.
+	if b.Created.IsZero() {
+		configs, err := b.getAllLegacyConfigs(ctx, objectAPI)
+		if err != nil {
+			return b, err
+		}
+
+		if len(configs) > 0 {
+			// Old bucket without bucket metadata. Hence we migrate existing settings.
+			if err = b.convertLegacyConfigs(ctx, objectAPI, configs); err != nil {
+				return b, err
+			}
+		}
 	}
 
-	if len(configs) == 0 {
-		if parse {
-			// nothing to update, parse and proceed.
-			err = b.parseAllConfigs(ctx, objectAPI)
+	if parse {
+		// nothing to update, parse and proceed.
+		if err = b.parseAllConfigs(ctx, objectAPI); err != nil {
+			return b, err
 		}
-	} else {
-		// Old bucket without bucket metadata. Hence we migrate existing settings.
-		err = b.convertLegacyConfigs(ctx, objectAPI, configs)
-	}
-	if err != nil {
-		return b, err
 	}
 
 	// migrate unencrypted remote targets
-	if err := b.migrateTargetConfig(ctx, objectAPI); err != nil {
+	if err = b.migrateTargetConfig(ctx, objectAPI); err != nil {
 		return b, err
 	}
 
@@ -331,7 +384,7 @@ func (b *BucketMetadata) getAllLegacyConfigs(ctx context.Context, objectAPI Obje
 	for _, legacyFile := range legacyConfigs {
 		configFile := path.Join(bucketMetaPrefix, b.Name, legacyFile)
 
-		configData, err := readConfig(ctx, objectAPI, configFile)
+		configData, info, err := readConfigWithMetadata(ctx, objectAPI, configFile, ObjectOptions{})
 		if err != nil {
 			if _, ok := err.(ObjectExistsAsDirectory); ok {
 				// in FS mode it possible that we have actual
@@ -346,6 +399,7 @@ func (b *BucketMetadata) getAllLegacyConfigs(ctx context.Context, objectAPI Obje
 			return nil, err
 		}
 		configs[legacyFile] = configData
+		b.Created = info.ModTime
 	}
 
 	return configs, nil
@@ -391,7 +445,7 @@ func (b *BucketMetadata) convertLegacyConfigs(ctx context.Context, objectAPI Obj
 	for legacyFile := range configs {
 		configFile := path.Join(bucketMetaPrefix, b.Name, legacyFile)
 		if err := deleteConfig(ctx, objectAPI, configFile); err != nil && !errors.Is(err, errConfigNotFound) {
-			logger.LogIf(ctx, err)
+			internalLogIf(ctx, err, logger.WarningKind)
 		}
 	}
 
@@ -430,6 +484,18 @@ func (b *BucketMetadata) defaultTimestamps() {
 
 	if b.LifecycleConfigUpdatedAt.IsZero() {
 		b.LifecycleConfigUpdatedAt = b.Created
+	}
+
+	if b.NotificationConfigUpdatedAt.IsZero() {
+		b.NotificationConfigUpdatedAt = b.Created
+	}
+
+	if b.BucketTargetsConfigUpdatedAt.IsZero() {
+		b.BucketTargetsConfigUpdatedAt = b.Created
+	}
+
+	if b.BucketTargetsConfigMetaUpdatedAt.IsZero() {
+		b.BucketTargetsConfigMetaUpdatedAt = b.Created
 	}
 }
 
@@ -481,7 +547,7 @@ func encryptBucketMetadata(ctx context.Context, bucket string, input []byte, kms
 	}
 
 	metadata := make(map[string]string)
-	key, err := GlobalKMS.GenerateKey(ctx, "", kmsContext)
+	key, err := GlobalKMS.GenerateKey(ctx, &kms.GenerateKeyRequest{AssociatedData: kmsContext})
 	if err != nil {
 		return
 	}
@@ -510,7 +576,11 @@ func decryptBucketMetadata(input []byte, bucket string, meta map[string]string, 
 	if err != nil {
 		return nil, err
 	}
-	extKey, err := GlobalKMS.DecryptKey(keyID, kmsKey, kmsContext)
+	extKey, err := GlobalKMS.Decrypt(context.TODO(), &kms.DecryptRequest{
+		Name:           keyID,
+		Ciphertext:     kmsKey,
+		AssociatedData: kmsContext,
+	})
 	if err != nil {
 		return nil, err
 	}

@@ -18,13 +18,17 @@
 package cmd
 
 import (
+	"math"
 	"net/http"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/shirou/gopsutil/v3/mem"
 
 	"github.com/minio/minio/internal/config/api"
@@ -36,16 +40,14 @@ import (
 type apiConfig struct {
 	mu sync.RWMutex
 
-	requestsDeadline time.Duration
-	requestsPool     chan struct{}
-	clusterDeadline  time.Duration
-	listQuorum       string
-	corsAllowOrigins []string
-	// total drives per erasure set across pools.
-	totalDriveCount       int
-	replicationPriority   string
-	replicationMaxWorkers int
-	transitionWorkers     int
+	requestsPool           chan struct{}
+	clusterDeadline        time.Duration
+	listQuorum             string
+	corsAllowOrigins       []string
+	replicationPriority    string
+	replicationMaxWorkers  int
+	replicationMaxLWorkers int
+	transitionWorkers      int
 
 	staleUploadsExpiry          time.Duration
 	staleUploadsCleanupInterval time.Duration
@@ -54,36 +56,46 @@ type apiConfig struct {
 	gzipObjects                 bool
 	rootAccess                  bool
 	syncEvents                  bool
+	objectMaxVersions           int64
 }
 
-const cgroupLimitFile = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+const (
+	cgroupV1MemLimitFile = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
+	cgroupV2MemLimitFile = "/sys/fs/cgroup/memory.max"
+)
 
-func cgroupLimit(limitFile string) (limit uint64) {
-	buf, err := os.ReadFile(limitFile)
+func cgroupMemLimit() (limit uint64) {
+	buf, err := os.ReadFile(cgroupV2MemLimitFile)
 	if err != nil {
-		return 9223372036854771712
+		buf, err = os.ReadFile(cgroupV1MemLimitFile)
 	}
-	limit, err = strconv.ParseUint(string(buf), 10, 64)
 	if err != nil {
-		return 9223372036854771712
+		return 0
+	}
+	limit, err = strconv.ParseUint(strings.TrimSpace(string(buf)), 10, 64)
+	if err != nil {
+		// The kernel can return valid but non integer values
+		// but still, no need to interpret more
+		return 0
+	}
+	if limit >= 100*humanize.TiByte {
+		// No limit set, or unreasonably high. Ignore
+		return 0
 	}
 	return limit
 }
 
 func availableMemory() (available uint64) {
-	available = 8 << 30 // Default to 8 GiB when we can't find the limits.
+	available = 2048 * blockSizeV2 * 2 // Default to 4 GiB when we can't find the limits.
 
 	if runtime.GOOS == "linux" {
-		available = cgroupLimit(cgroupLimitFile)
-
-		// No limit set, It's the highest positive signed 64-bit
-		// integer (2^63-1), rounded down to multiples of 4096 (2^12),
-		// the most common page size on x86 systems - for cgroup_limits.
-		if available != 9223372036854771712 {
-			// This means cgroup memory limit is configured.
+		// Honor cgroup limits if set.
+		limit := cgroupMemLimit()
+		if limit > 0 {
+			// A valid value is found, return its 90%
+			available = (limit * 9) / 10
 			return
-		} // no-limit set proceed to set the limits based on virtual memory.
-
+		}
 	} // for all other platforms limits are based on virtual memory.
 
 	memStats, err := mem.VirtualMemory()
@@ -91,11 +103,12 @@ func availableMemory() (available uint64) {
 		return
 	}
 
-	available = memStats.Available / 2
+	// A valid value is available return its 90%
+	available = (memStats.Available * 9) / 10
 	return
 }
 
-func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
+func (t *apiConfig) init(cfg api.Config, setDriveCounts []int, legacy bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -110,32 +123,34 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 	}
 	t.corsAllowOrigins = corsAllowOrigin
 
-	maxSetDrives := 0
-	for _, setDriveCount := range setDriveCounts {
-		t.totalDriveCount += setDriveCount
-		if setDriveCount > maxSetDrives {
-			maxSetDrives = setDriveCount
-		}
-	}
-
 	var apiRequestsMaxPerNode int
 	if cfg.RequestsMax <= 0 {
-		maxMem := availableMemory()
+		maxSetDrives := slices.Max(setDriveCounts)
+
+		// Returns 75% of max memory allowed
+		maxMem := globalServerCtxt.MemLimit
 
 		// max requests per node is calculated as
 		// total_ram / ram_per_request
-		// ram_per_request is (2MiB+128KiB) * driveCount \
-		//    + 2 * 10MiB (default erasure block size v1) + 2 * 1MiB (default erasure block size v2)
-		blockSize := xioutil.BlockSizeLarge + xioutil.BlockSizeSmall
-		apiRequestsMaxPerNode = int(maxMem / uint64(maxSetDrives*blockSize+int(blockSizeV1*2+blockSizeV2*2)))
-		if globalIsDistErasure {
-			logger.Info("Automatically configured API requests per node based on available memory on the system: %d", apiRequestsMaxPerNode)
+		blockSize := xioutil.LargeBlock + xioutil.SmallBlock
+		if legacy {
+			// ram_per_request is (1MiB+32KiB) * driveCount \
+			//    + 2 * 10MiB (default erasure block size v1) + 2 * 1MiB (default erasure block size v2)
+			apiRequestsMaxPerNode = int(maxMem / uint64(maxSetDrives*blockSize+int(blockSizeV1*2+blockSizeV2*2)))
+		} else {
+			// ram_per_request is (1MiB+32KiB) * driveCount \
+			//    + 2 * 1MiB (default erasure block size v2)
+			apiRequestsMaxPerNode = int(maxMem / uint64(maxSetDrives*blockSize+int(blockSizeV2*2)))
 		}
 	} else {
 		apiRequestsMaxPerNode = cfg.RequestsMax
-		if len(globalEndpoints.Hostnames()) > 0 {
-			apiRequestsMaxPerNode /= len(globalEndpoints.Hostnames())
+		if n := totalNodeCount(); n > 0 {
+			apiRequestsMaxPerNode /= n
 		}
+	}
+
+	if globalIsDistErasure {
+		logger.Info("Configured max API requests per node based on available memory: %d", apiRequestsMaxPerNode)
 	}
 
 	if cap(t.requestsPool) != apiRequestsMaxPerNode {
@@ -146,30 +161,42 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 		// but this shouldn't last long.
 		t.requestsPool = make(chan struct{}, apiRequestsMaxPerNode)
 	}
-	t.requestsDeadline = cfg.RequestsDeadline
 	listQuorum := cfg.ListQuorum
 	if listQuorum == "" {
 		listQuorum = "strict"
 	}
 	t.listQuorum = listQuorum
-	if globalReplicationPool != nil &&
-		(cfg.ReplicationPriority != t.replicationPriority || cfg.ReplicationMaxWorkers != t.replicationMaxWorkers) {
-		globalReplicationPool.ResizeWorkerPriority(cfg.ReplicationPriority, cfg.ReplicationMaxWorkers)
+	if r := globalReplicationPool.GetNonBlocking(); r != nil &&
+		(cfg.ReplicationPriority != t.replicationPriority || cfg.ReplicationMaxWorkers != t.replicationMaxWorkers || cfg.ReplicationMaxLWorkers != t.replicationMaxLWorkers) {
+		r.ResizeWorkerPriority(cfg.ReplicationPriority, cfg.ReplicationMaxWorkers, cfg.ReplicationMaxLWorkers)
 	}
 	t.replicationPriority = cfg.ReplicationPriority
 	t.replicationMaxWorkers = cfg.ReplicationMaxWorkers
-	if globalTransitionState != nil && cfg.TransitionWorkers != t.transitionWorkers {
+	t.replicationMaxLWorkers = cfg.ReplicationMaxLWorkers
+
+	// N B api.transition_workers will be deprecated
+	if globalTransitionState != nil {
 		globalTransitionState.UpdateWorkers(cfg.TransitionWorkers)
 	}
 	t.transitionWorkers = cfg.TransitionWorkers
 
 	t.staleUploadsExpiry = cfg.StaleUploadsExpiry
-	t.staleUploadsCleanupInterval = cfg.StaleUploadsCleanupInterval
 	t.deleteCleanupInterval = cfg.DeleteCleanupInterval
 	t.enableODirect = cfg.EnableODirect
 	t.gzipObjects = cfg.GzipObjects
 	t.rootAccess = cfg.RootAccess
 	t.syncEvents = cfg.SyncEvents
+	t.objectMaxVersions = cfg.ObjectMaxVersions
+
+	if t.staleUploadsCleanupInterval != cfg.StaleUploadsCleanupInterval {
+		t.staleUploadsCleanupInterval = cfg.StaleUploadsCleanupInterval
+
+		// signal that cleanup interval has changed
+		select {
+		case staleUploadsCleanupIntervalChangedCh <- struct{}{}:
+		default: // in case the channel is blocked...
+		}
+	}
 }
 
 func (t *apiConfig) odirectEnabled() bool {
@@ -268,15 +295,15 @@ func (t *apiConfig) getRequestsPoolCapacity() int {
 	return cap(t.requestsPool)
 }
 
-func (t *apiConfig) getRequestsPool() (chan struct{}, time.Duration) {
+func (t *apiConfig) getRequestsPool() chan struct{} {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	if t.requestsPool == nil {
-		return nil, time.Duration(0)
+		return nil
 	}
 
-	return t.requestsPool, t.requestsDeadline
+	return t.requestsPool
 }
 
 // maxClients throttles the S3 API calls
@@ -298,40 +325,48 @@ func maxClients(f http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
-		pool, deadline := globalAPIConfig.getRequestsPool()
+		globalHTTPStats.addRequestsInQueue(1)
+		pool := globalAPIConfig.getRequestsPool()
 		if pool == nil {
+			globalHTTPStats.addRequestsInQueue(-1)
 			f.ServeHTTP(w, r)
 			return
 		}
-
-		globalHTTPStats.addRequestsInQueue(1)
 
 		if tc, ok := r.Context().Value(mcontext.ContextTraceKey).(*mcontext.TraceCtxt); ok {
 			tc.FuncName = "s3.MaxClients"
 		}
 
-		deadlineTimer := time.NewTimer(deadline)
-		defer deadlineTimer.Stop()
+		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(cap(pool)))
+		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(cap(pool)-len(pool)))
 
+		ctx := r.Context()
 		select {
 		case pool <- struct{}{}:
 			defer func() { <-pool }()
 			globalHTTPStats.addRequestsInQueue(-1)
+			if contextCanceled(ctx) {
+				w.WriteHeader(499)
+				return
+			}
 			f.ServeHTTP(w, r)
-		case <-deadlineTimer.C:
-			// Send a http timeout message
-			writeErrorResponse(r.Context(), w,
-				errorCodes.ToAPIErr(ErrTooManyRequests),
-				r.URL)
-			globalHTTPStats.addRequestsInQueue(-1)
-			return
 		case <-r.Context().Done():
+			globalHTTPStats.addRequestsInQueue(-1)
 			// When the client disconnects before getting the S3 handler
 			// status code response, set the status code to 499 so this request
 			// will be properly audited and traced.
 			w.WriteHeader(499)
+		default:
 			globalHTTPStats.addRequestsInQueue(-1)
-			return
+			if contextCanceled(ctx) {
+				w.WriteHeader(499)
+				return
+			}
+			// Send a http timeout message
+			writeErrorResponse(ctx, w,
+				errorCodes.ToAPIErr(ErrTooManyRequests),
+				r.URL)
+
 		}
 	}
 }
@@ -342,14 +377,16 @@ func (t *apiConfig) getReplicationOpts() replicationPoolOpts {
 
 	if t.replicationPriority == "" {
 		return replicationPoolOpts{
-			Priority:   "auto",
-			MaxWorkers: WorkerMaxLimit,
+			Priority:    "auto",
+			MaxWorkers:  WorkerMaxLimit,
+			MaxLWorkers: LargeWorkerCount,
 		}
 	}
 
 	return replicationPoolOpts{
-		Priority:   t.replicationPriority,
-		MaxWorkers: t.replicationMaxWorkers,
+		Priority:    t.replicationPriority,
+		MaxWorkers:  t.replicationMaxWorkers,
+		MaxLWorkers: t.replicationMaxLWorkers,
 	}
 }
 
@@ -369,4 +406,16 @@ func (t *apiConfig) isSyncEventsEnabled() bool {
 	defer t.mu.RUnlock()
 
 	return t.syncEvents
+}
+
+func (t *apiConfig) getObjectMaxVersions() int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if t.objectMaxVersions <= 0 {
+		// defaults to 'IntMax' when unset.
+		return math.MaxInt64
+	}
+
+	return t.objectMaxVersions
 }

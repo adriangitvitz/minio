@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/minio/minio/internal/amztime"
@@ -138,7 +139,7 @@ func checkCopyObjectPreconditions(ctx context.Context, w http.ResponseWriter, r 
 //	x-minio-source-etag
 func checkPreconditionsPUT(ctx context.Context, w http.ResponseWriter, r *http.Request, objInfo ObjectInfo, opts ObjectOptions) bool {
 	// Return false for methods other than PUT.
-	if r.Method != http.MethodPut {
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
 		return false
 	}
 	// If the object doesn't have a modtime (IsZero), or the modtime
@@ -185,7 +186,7 @@ func checkPreconditionsPUT(ctx context.Context, w http.ResponseWriter, r *http.R
 		if isETagEqual(objInfo.ETag, ifNoneMatchETagHeader) {
 			// If the object ETag matches with the specified ETag.
 			writeHeaders()
-			w.WriteHeader(http.StatusNotModified)
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrPreconditionFailed), r.URL)
 			return true
 		}
 	}
@@ -247,10 +248,19 @@ func checkPreconditions(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	}
 
 	// Check if the part number is correct.
-	if opts.PartNumber > 1 && opts.PartNumber > len(objInfo.Parts) {
-		// According to S3 we don't need to set any object information here.
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidPartNumber), r.URL)
-		return true
+	if opts.PartNumber > 1 {
+		partFound := false
+		for _, pi := range objInfo.Parts {
+			if pi.Number == opts.PartNumber {
+				partFound = true
+				break
+			}
+		}
+		if !partFound {
+			// According to S3 we don't need to set any object information here.
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidPartNumber), r.URL)
+			return true
+		}
 	}
 
 	// If-None-Match : Return the object only if its entity tag (ETag) is different from the
@@ -258,6 +268,14 @@ func checkPreconditions(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	ifNoneMatchETagHeader := r.Header.Get(xhttp.IfNoneMatch)
 	if ifNoneMatchETagHeader != "" {
 		if isETagEqual(objInfo.ETag, ifNoneMatchETagHeader) {
+			// Do not care If-Modified-Since, Because:
+			// 1. If If-Modified-Since condition evaluates to true.
+			//  If both of the If-None-Match and If-Modified-Since headers are present in the request as follows:
+			// 	If-None-Match condition evaluates to false , and;
+			//  If-Modified-Since condition evaluates to true ;
+			// 	Then Amazon S3 returns the 304 Not Modified response code.
+			// 2. If If-Modified-Since condition evaluates to false, The following `ifModifiedSinceHeader` judgment will also return 304
+
 			// If the object ETag matches with the specified ETag.
 			writeHeadersPrecondition(w, objInfo)
 			w.WriteHeader(http.StatusNotModified)
@@ -294,7 +312,7 @@ func checkPreconditions(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	// If-Unmodified-Since : Return the object only if it has not been modified since the specified
 	// time, otherwise return a 412 (precondition failed).
 	ifUnmodifiedSinceHeader := r.Header.Get(xhttp.IfUnmodifiedSince)
-	if ifUnmodifiedSinceHeader != "" {
+	if ifUnmodifiedSinceHeader != "" && ifMatchETagHeader == "" {
 		if givenTime, err := amztime.ParseHeader(ifUnmodifiedSinceHeader); err == nil {
 			if ifModifiedSince(objInfo.ModTime, givenTime) {
 				// If the object is modified since the specified time.
@@ -325,17 +343,20 @@ func canonicalizeETag(etag string) string {
 // isETagEqual return true if the canonical representations of two ETag strings
 // are equal, false otherwise
 func isETagEqual(left, right string) bool {
+	if strings.TrimSpace(right) == "*" {
+		return true
+	}
 	return canonicalizeETag(left) == canonicalizeETag(right)
 }
 
 // setPutObjHeaders sets all the necessary headers returned back
 // upon a success Put/Copy/CompleteMultipart/Delete requests
 // to activate delete only headers set delete as true
-func setPutObjHeaders(w http.ResponseWriter, objInfo ObjectInfo, delete bool) {
+func setPutObjHeaders(w http.ResponseWriter, objInfo ObjectInfo, del bool, h http.Header) {
 	// We must not use the http.Header().Set method here because some (broken)
 	// clients expect the ETag header key to be literally "ETag" - not "Etag" (case-sensitive).
 	// Therefore, we have to set the ETag directly as map entry.
-	if objInfo.ETag != "" && !delete {
+	if objInfo.ETag != "" && !del {
 		w.Header()[xhttp.ETag] = []string{`"` + objInfo.ETag + `"`}
 	}
 
@@ -343,17 +364,17 @@ func setPutObjHeaders(w http.ResponseWriter, objInfo ObjectInfo, delete bool) {
 	if objInfo.VersionID != "" && objInfo.VersionID != nullVersionID {
 		w.Header()[xhttp.AmzVersionID] = []string{objInfo.VersionID}
 		// If version is a deleted marker, set this header as well
-		if objInfo.DeleteMarker && delete { // only returned during delete object
+		if objInfo.DeleteMarker && del { // only returned during delete object
 			w.Header()[xhttp.AmzDeleteMarker] = []string{strconv.FormatBool(objInfo.DeleteMarker)}
 		}
 	}
 
 	if objInfo.Bucket != "" && objInfo.Name != "" {
-		if lc, err := globalLifecycleSys.Get(objInfo.Bucket); err == nil && !delete {
+		if lc, err := globalLifecycleSys.Get(objInfo.Bucket); err == nil && !del {
 			lc.SetPredictionHeaders(w, objInfo.ToLifecycleOpts())
 		}
 	}
-	hash.AddChecksumHeader(w, objInfo.decryptChecksums(0))
+	hash.AddChecksumHeader(w, objInfo.decryptChecksums(0, h))
 }
 
 func deleteObjectVersions(ctx context.Context, o ObjectLayer, bucket string, toDel []ObjectToDelete, lcEvent lifecycle.Event) {

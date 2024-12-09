@@ -28,6 +28,7 @@ var (
 	errLifecycleInvalidExpiration   = Errorf("Exactly one of Days (positive integer) or Date (positive ISO 8601 format) should be present inside Expiration.")
 	errLifecycleInvalidDeleteMarker = Errorf("Delete marker cannot be specified with Days or Date in a Lifecycle Expiration Policy")
 	errLifecycleDateNotMidnight     = Errorf("'Date' must be at midnight GMT")
+	errLifecycleInvalidDeleteAll    = Errorf("Days (positive integer) should be present inside Expiration with ExpiredObjectAllVersions.")
 )
 
 // ExpirationDays is a type alias to unmarshal Days in Expiration
@@ -78,10 +79,10 @@ func (eDate *ExpirationDate) UnmarshalXML(d *xml.Decoder, startElement xml.Start
 		return errLifecycleInvalidDate
 	}
 	// Allow only date timestamp specifying midnight GMT
-	hr, min, sec := expDate.Clock()
+	hr, m, sec := expDate.Clock()
 	nsec := expDate.Nanosecond()
 	loc := expDate.Location()
-	if !(hr == 0 && min == 0 && sec == 0 && nsec == 0 && loc.String() == time.UTC.String()) {
+	if !(hr == 0 && m == 0 && sec == 0 && nsec == 0 && loc.String() == time.UTC.String()) {
 		return errLifecycleDateNotMidnight
 	}
 
@@ -177,13 +178,18 @@ func (e Expiration) Validate() error {
 		return errLifecycleInvalidDeleteMarker
 	}
 
-	if !e.DeleteMarker.set && e.IsDaysNull() && e.IsDateNull() {
+	if !e.DeleteMarker.set && !e.DeleteAll.set && e.IsDaysNull() && e.IsDateNull() {
 		return errXMLNotWellFormed
 	}
 
 	// Both expiration days and date are specified
 	if !e.IsDaysNull() && !e.IsDateNull() {
 		return errLifecycleInvalidExpiration
+	}
+
+	// DeleteAll set without expiration days
+	if e.DeleteAll.set && e.IsDaysNull() {
+		return errLifecycleInvalidDeleteAll
 	}
 
 	return nil

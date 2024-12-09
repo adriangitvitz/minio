@@ -45,6 +45,8 @@ type ReplicationStats struct {
 	workers *ActiveWorkerStat
 	// queue stats cache
 	qCache queueCache
+
+	pCache proxyStatsCache
 	// mrf backlog stats
 	mrfStats ReplicationMRFStats
 	// for bucket replication, continue to use existing cache
@@ -85,6 +87,9 @@ func (r *ReplicationStats) updateMovingAvg() {
 
 // ActiveWorkers returns worker stats
 func (r *ReplicationStats) ActiveWorkers() ActiveWorkerStat {
+	if r == nil {
+		return ActiveWorkerStat{}
+	}
 	r.wlock.RLock()
 	defer r.wlock.RUnlock()
 	w := r.workers.get()
@@ -305,6 +310,7 @@ func (r *ReplicationStats) getSRMetricsForNode() SRMetricsSummary {
 		Queued:        r.qCache.getSiteStats(),
 		ActiveWorkers: r.ActiveWorkers(),
 		Metrics:       r.srStats.get(),
+		Proxied:       r.pCache.getSiteStats(),
 		ReplicaSize:   atomic.LoadInt64(&r.srStats.ReplicaSize),
 		ReplicaCount:  atomic.LoadInt64(&r.srStats.ReplicaCount),
 	}
@@ -333,6 +339,7 @@ func NewReplicationStats(ctx context.Context, objectAPI ObjectLayer) *Replicatio
 	rs := ReplicationStats{
 		Cache:           make(map[string]*BucketReplicationStats),
 		qCache:          newQueueCache(r),
+		pCache:          newProxyStatsCache(),
 		srStats:         newSRStats(),
 		movingAvgTicker: time.NewTicker(2 * time.Second),
 		wTimer:          time.NewTicker(2 * time.Second),
@@ -347,6 +354,9 @@ func NewReplicationStats(ctx context.Context, objectAPI ObjectLayer) *Replicatio
 }
 
 func (r *ReplicationStats) getAllLatest(bucketsUsage map[string]BucketUsageInfo) (bucketsReplicationStats map[string]BucketStats) {
+	if r == nil {
+		return nil
+	}
 	peerBucketStatsList := globalNotificationSys.GetClusterAllBucketStats(GlobalContext)
 	bucketsReplicationStats = make(map[string]BucketStats, len(bucketsUsage))
 
@@ -371,6 +381,7 @@ func (r *ReplicationStats) calculateBucketReplicationStats(bucket string, bucket
 				Stats: make(map[string]*BucketReplicationStat),
 			},
 			QueueStats: ReplicationQueueStats{},
+			ProxyStats: ProxyMetric{},
 		}
 		return bs
 	}
@@ -430,11 +441,16 @@ func (r *ReplicationStats) calculateBucketReplicationStats(bucket string, bucket
 	for _, bs := range bucketStats {
 		qs.Nodes = append(qs.Nodes, bs.QueueStats.Nodes...)
 	}
-
 	qs.Uptime = UTCNow().Unix() - globalBootTime.Unix()
+
+	var ps ProxyMetric
+	for _, bs := range bucketStats {
+		ps.add(bs.ProxyStats)
+	}
 	bs = BucketStats{
 		ReplicationStats: s,
 		QueueStats:       qs,
+		ProxyStats:       ps,
 	}
 	r.mostRecentStatsMu.Lock()
 	if len(r.mostRecentStats.Stats) == 0 {
@@ -450,11 +466,14 @@ func (r *ReplicationStats) calculateBucketReplicationStats(bucket string, bucket
 
 // get the most current of in-memory replication stats  and data usage info from crawler.
 func (r *ReplicationStats) getLatestReplicationStats(bucket string) (s BucketStats) {
+	if r == nil {
+		return s
+	}
 	bucketStats := globalNotificationSys.GetClusterBucketStats(GlobalContext, bucket)
 	return r.calculateBucketReplicationStats(bucket, bucketStats)
 }
 
-func (r *ReplicationStats) incQ(bucket string, sz int64, isDeleleRepl bool, opType replication.Type) {
+func (r *ReplicationStats) incQ(bucket string, sz int64, isDeleteRepl bool, opType replication.Type) {
 	r.qCache.Lock()
 	defer r.qCache.Unlock()
 	v, ok := r.qCache.bucketStats[bucket]
@@ -481,4 +500,18 @@ func (r *ReplicationStats) decQ(bucket string, sz int64, isDelMarker bool, opTyp
 
 	atomic.AddInt64(&r.qCache.srQueueStats.nowBytes, -1*sz)
 	atomic.AddInt64(&r.qCache.srQueueStats.nowCount, -1)
+}
+
+// incProxy increments proxy metrics for proxied calls
+func (r *ReplicationStats) incProxy(bucket string, api replProxyAPI, isErr bool) {
+	if r != nil {
+		r.pCache.inc(bucket, api, isErr)
+	}
+}
+
+func (r *ReplicationStats) getProxyStats(bucket string) ProxyMetric {
+	if r == nil {
+		return ProxyMetric{}
+	}
+	return r.pCache.getBucketStats(bucket)
 }

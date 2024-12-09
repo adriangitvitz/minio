@@ -16,12 +16,12 @@ fi
 export CI=true
 export MINIO_SCANNER_SPEED=fastest
 
-(minio server /tmp/xl/{1...10}/disk{0...1} 2>&1 >/tmp/decom.log) &
+(minio server http://localhost:9000/tmp/xl/{1...10}/disk{0...1} 2>&1 >/tmp/decom.log) &
 pid=$!
 
-sleep 10
-
 export MC_HOST_myminio="http://minioadmin:minioadmin@localhost:9000/"
+
+./mc ready myminio
 
 ./mc admin user add myminio/ minio123 minio123
 ./mc admin user add myminio/ minio12345 minio12345
@@ -48,16 +48,17 @@ user_count=$(./mc admin user list myminio/ | wc -l)
 policy_count=$(./mc admin policy list myminio/ | wc -l)
 
 ## create a warm tier instance
-(minio server /tmp/xltier/{1...4}/disk{0...1} --address :9001 2>&1 >/dev/null) &
-sleep 10
+(minio server /tmp/xltier/{1...4}/disk{0...1} --address :9002 2>&1 >/dev/null) &
 
-export MC_HOST_mytier="http://minioadmin:minioadmin@localhost:9001/"
+export MC_HOST_mytier="http://minioadmin:minioadmin@localhost:9002/"
+
+./mc ready myminio
 
 ./mc mb -l myminio/bucket2
 ./mc mb -l mytier/tiered
 
 ## create a tier and set up ilm policy to tier immediately
-./mc admin tier add minio myminio TIER1 --endpoint http://localhost:9001 --access-key minioadmin --secret-key minioadmin --bucket tiered --prefix prefix5/
+./mc admin tier add minio myminio TIER1 --endpoint http://localhost:9002 --access-key minioadmin --secret-key minioadmin --bucket tiered --prefix prefix5/
 ./mc ilm add myminio/bucket2 --transition-days 0 --transition-tier TIER1 --transition-days 0
 
 ## mirror some content to bucket2 and capture versions tiered
@@ -70,10 +71,14 @@ sleep 30
 ./mc ls -r --versions mytier/tiered/ >tiered_ns_versions.txt
 
 kill $pid
-(minio server /tmp/xl/{1...10}/disk{0...1} /tmp/xl/{11...30}/disk{0...3} 2>&1 >/tmp/expanded.log) &
-pid=$!
 
-sleep 30
+(minio server http://localhost:9000/tmp/xl/{1...10}/disk{0...1} http://localhost:9001/tmp/xl/{11...30}/disk{0...3} 2>&1 >/tmp/expanded_1.log) &
+pid_1=$!
+
+(minio server --address ":9001" http://localhost:9000/tmp/xl/{1...10}/disk{0...1} http://localhost:9001/tmp/xl/{11...30}/disk{0...3} 2>&1 >/tmp/expanded_2.log) &
+pid_2=$!
+
+./mc ready myminio
 
 expanded_user_count=$(./mc admin user list myminio/ | wc -l)
 expanded_policy_count=$(./mc admin policy list myminio/ | wc -l)
@@ -100,24 +105,30 @@ fi
 ./mc ls -r myminio/versioned/ >expanded_ns.txt
 ./mc ls -r --versions myminio/versioned/ >expanded_ns_versions.txt
 
-./mc admin decom start myminio/ /tmp/xl/{1...10}/disk{0...1}
+./mc admin decom start myminio/ http://localhost:9000/tmp/xl/{1...10}/disk{0...1}
 
 count=0
 until $(./mc admin decom status myminio/ | grep -q Complete); do
 	echo "waiting for decom to finish..."
 	count=$((count + 1))
 	if [ ${count} -eq 120 ]; then
-		./mc cat /tmp/expanded.log
+		./mc cat /tmp/expanded_*.log
 	fi
 	sleep 1
 done
 
-kill $pid
+kill $pid_1
+kill $pid_2
 
-(minio server /tmp/xl/{11...30}/disk{0...3} 2>&1 >/dev/null) &
+sleep 5
+
+(minio server --address ":9001" http://localhost:9001/tmp/xl/{11...30}/disk{0...3} 2>&1 >/tmp/removed.log) &
 pid=$!
 
-sleep 20
+sleep 5
+export MC_HOST_myminio="http://minioadmin:minioadmin@localhost:9001/"
+
+./mc ready myminio
 
 decom_user_count=$(./mc admin user list myminio/ | wc -l)
 decom_policy_count=$(./mc admin policy list myminio/ | wc -l)
@@ -200,5 +211,8 @@ if [ "${expected_checksum}" != "${got_checksum}" ]; then
 	echo "BUG: decommission failed on encrypted objects with tiering: expected ${expected_checksum} got ${got_checksum}"
 	exit 1
 fi
+
+s3-check-md5 -versions -access-key minioadmin -secret-key minioadmin -endpoint http://127.0.0.1:9001/ -bucket bucket2
+s3-check-md5 -versions -access-key minioadmin -secret-key minioadmin -endpoint http://127.0.0.1:9001/ -bucket versioned
 
 kill $pid

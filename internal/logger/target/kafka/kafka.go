@@ -24,7 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -34,10 +34,11 @@ import (
 	"github.com/IBM/sarama"
 	saramatls "github.com/IBM/sarama/tools/tls"
 
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger/target/types"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/v2/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // the suffix for the configured queue dir where the logs will be persisted.
@@ -77,35 +78,6 @@ type Config struct {
 	LogOnce func(ctx context.Context, err error, id string, errKind ...interface{}) `json:"-"`
 }
 
-// Check if atleast one broker in cluster is active
-func (k Config) pingBrokers() (err error) {
-	d := net.Dialer{Timeout: 1 * time.Second}
-
-	errs := make([]error, len(k.Brokers))
-	var wg sync.WaitGroup
-	for idx, broker := range k.Brokers {
-		broker := broker
-		idx := idx
-		wg.Add(1)
-		go func(broker xnet.Host, idx int) {
-			defer wg.Done()
-
-			_, errs[idx] = d.Dial("tcp", broker.String())
-		}(broker, idx)
-	}
-	wg.Wait()
-
-	var retErr error
-	for _, err := range errs {
-		if err == nil {
-			// if one broker is online its enough
-			return nil
-		}
-		retErr = err
-	}
-	return retErr
-}
-
 // Target - Kafka target.
 type Target struct {
 	status int32
@@ -129,6 +101,7 @@ type Target struct {
 	initKafkaOnce      once.Init
 	initQueueStoreOnce once.Init
 
+	client   sarama.Client
 	producer sarama.SyncProducer
 	kconfig  Config
 	config   *sarama.Config
@@ -191,14 +164,13 @@ func (h *Target) Init(ctx context.Context) error {
 	if err := h.init(); err != nil {
 		return err
 	}
-	go h.startKakfaLogger()
+	go h.startKafkaLogger()
 	return nil
 }
 
 func (h *Target) initQueueStore(ctx context.Context) (err error) {
-	var queueStore store.Store[interface{}]
 	queueDir := filepath.Join(h.kconfig.QueueDir, h.Name())
-	queueStore = store.NewQueueStore[interface{}](queueDir, uint64(h.kconfig.QueueSize), kafkaLoggerExtension)
+	queueStore := store.NewQueueStore[interface{}](queueDir, uint64(h.kconfig.QueueSize), kafkaLoggerExtension)
 	if err = queueStore.Open(); err != nil {
 		return fmt.Errorf("unable to initialize the queue store of %s webhook: %w", h.Name(), err)
 	}
@@ -209,7 +181,7 @@ func (h *Target) initQueueStore(ctx context.Context) (err error) {
 	return
 }
 
-func (h *Target) startKakfaLogger() {
+func (h *Target) startKafkaLogger() {
 	h.logChMu.RLock()
 	logCh := h.logCh
 	if logCh != nil {
@@ -262,8 +234,8 @@ func (h *Target) send(entry interface{}) error {
 
 // Init initialize kafka target
 func (h *Target) init() error {
-	if err := h.kconfig.pingBrokers(); err != nil {
-		return err
+	if os.Getenv("_MINIO_KAFKA_DEBUG") != "" {
+		sarama.DebugLogger = log.Default()
 	}
 
 	sconfig := sarama.NewConfig()
@@ -314,13 +286,23 @@ func (h *Target) init() error {
 		brokers = append(brokers, broker.String())
 	}
 
-	producer, err := sarama.NewSyncProducer(brokers, sconfig)
+	client, err := sarama.NewClient(brokers, sconfig)
 	if err != nil {
 		return err
 	}
 
+	producer, err := sarama.NewSyncProducerFromClient(client)
+	if err != nil {
+		return err
+	}
+	h.client = client
 	h.producer = producer
-	atomic.StoreInt32(&h.status, statusOnline)
+
+	if len(h.client.Brokers()) > 0 {
+		// Refer https://github.com/IBM/sarama/issues/1341
+		atomic.StoreInt32(&h.status, statusOnline)
+	}
+
 	return nil
 }
 
@@ -333,7 +315,8 @@ func (h *Target) IsOnline(_ context.Context) bool {
 func (h *Target) Send(ctx context.Context, entry interface{}) error {
 	if h.store != nil {
 		// save the entry to the queue store which will be replayed to the target.
-		return h.store.Put(entry)
+		_, err := h.store.Put(entry)
+		return err
 	}
 	h.logChMu.RLock()
 	defer h.logChMu.RUnlock()
@@ -362,7 +345,7 @@ func (h *Target) Send(ctx context.Context, entry interface{}) error {
 
 // SendFromStore - reads the log from store and sends it to kafka.
 func (h *Target) SendFromStore(key store.Key) (err error) {
-	auditEntry, err := h.store.Get(key.Name)
+	auditEntry, err := h.store.Get(key)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -376,7 +359,7 @@ func (h *Target) SendFromStore(key store.Key) (err error) {
 		return
 	}
 	// Delete the event from store.
-	return h.store.Del(key.Name)
+	return h.store.Del(key)
 }
 
 // Cancel - cancels the target
@@ -392,12 +375,13 @@ func (h *Target) Cancel() {
 	// and finish the existing ones.
 	// All future ones will be discarded.
 	h.logChMu.Lock()
-	close(h.logCh)
+	xioutil.SafeClose(h.logCh)
 	h.logCh = nil
 	h.logChMu.Unlock()
 
 	if h.producer != nil {
 		h.producer.Close()
+		h.client.Close()
 	}
 
 	// Wait for messages to be sent...

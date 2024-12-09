@@ -53,6 +53,12 @@ var (
 			Sensitive:   true,
 		},
 		config.HelpKV{
+			Key:         BatchSize,
+			Description: "Number of events per HTTP send to webhook target",
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
 			Key:         QueueSize,
 			Description: "configure channel queue size for webhook targets",
 			Optional:    true,
@@ -69,6 +75,24 @@ var (
 			Description: "proxy url endpoint e.g. http(s)://proxy",
 			Optional:    true,
 			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         MaxRetry,
+			Description: `maximum retry count before we start dropping logged event(s)`,
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         RetryInterval,
+			Description: `sleep between each retries, allowed maximum value is '1m' e.g. '10s'`,
+			Optional:    true,
+			Type:        "duration",
+		},
+		config.HelpKV{
+			Key:         httpTimeout,
+			Description: `defines the maximum duration for each http request`,
+			Optional:    true,
+			Type:        "duration",
 		},
 		config.HelpKV{
 			Key:         config.Comment,
@@ -108,6 +132,12 @@ var (
 			Sensitive:   true,
 		},
 		config.HelpKV{
+			Key:         BatchSize,
+			Description: "Number of events per HTTP send to webhook target",
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
 			Key:         QueueSize,
 			Description: "configure channel queue size for webhook targets",
 			Optional:    true,
@@ -118,6 +148,24 @@ var (
 			Description: `staging dir for undelivered audit messages e.g. '/home/audit-events'`,
 			Optional:    true,
 			Type:        "string",
+		},
+		config.HelpKV{
+			Key:         MaxRetry,
+			Description: `maximum retry count before we start dropping audit event(s)`,
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         RetryInterval,
+			Description: `sleep between each retries, allowed maximum value is '1m' e.g. '10s'`,
+			Optional:    true,
+			Type:        "duration",
+		},
+		config.HelpKV{
+			Key:         httpTimeout,
+			Description: `defines the maximum duration for each http request`,
+			Optional:    true,
+			Type:        "duration",
 		},
 		config.HelpKV{
 			Key:         config.Comment,

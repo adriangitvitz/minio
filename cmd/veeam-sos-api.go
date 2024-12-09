@@ -22,8 +22,11 @@ import (
 	"context"
 	"encoding/xml"
 	"io"
+	"os"
+	"strings"
 
 	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio/internal/logger"
 )
 
 // From Veeam-SOSAPI_1.0_Document_v1.02d.pdf
@@ -83,6 +86,11 @@ type apiEndpoints struct {
 	STSEndpoint string `xml:"STSEndpoint"`
 }
 
+// globalVeeamForceSC is set by the environment variable _MINIO_VEEAM_FORCE_SC
+// This will override the storage class returned by the storage backend if it is non-standard
+// and we detect a Veeam client by checking the User Agent.
+var globalVeeamForceSC = os.Getenv("_MINIO_VEEAM_FORCE_SC")
+
 type systemInfo struct {
 	XMLName              xml.Name `xml:"SystemInfo" json:"-"`
 	ProtocolVersion      string   `xml:"ProtocolVersion"`
@@ -115,7 +123,23 @@ type capacityInfo struct {
 const (
 	systemXMLObject   = ".system-d26a9498-cb7c-4a87-a44a-8ae204f5ba6c/system.xml"
 	capacityXMLObject = ".system-d26a9498-cb7c-4a87-a44a-8ae204f5ba6c/capacity.xml"
+	veeamAgentSubstr  = "APN/1.0 Veeam/1.0"
 )
+
+func isVeeamSOSAPIObject(object string) bool {
+	switch object {
+	case systemXMLObject, capacityXMLObject:
+		return true
+	default:
+		return false
+	}
+}
+
+// isVeeamClient - returns true if the request is from Veeam client.
+func isVeeamClient(ctx context.Context) bool {
+	ri := logger.GetReqInfo(ctx)
+	return ri != nil && strings.Contains(ri.UserAgent, veeamAgentSubstr)
+}
 
 func veeamSOSAPIHeadObject(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
 	gr, err := veeamSOSAPIGetObject(ctx, bucket, object, nil, opts)
@@ -147,7 +171,7 @@ func veeamSOSAPIGetObject(ctx context.Context, bucket, object string, rs *HTTPRa
 		}
 
 		q, _ := globalBucketQuotaSys.Get(ctx, bucket)
-		binfo, _ := globalBucketQuotaSys.GetBucketUsageInfo(bucket)
+		binfo := globalBucketQuotaSys.GetBucketUsageInfo(ctx, bucket)
 
 		ci := capacityInfo{
 			Used: int64(binfo.Size),
@@ -163,7 +187,7 @@ func veeamSOSAPIGetObject(ctx context.Context, bucket, object string, rs *HTTPRa
 		}
 
 		if quotaSize == 0 {
-			info := objAPI.StorageInfo(ctx)
+			info := objAPI.StorageInfo(ctx, true)
 			info.Backend = objAPI.BackendInfo()
 
 			ci.Capacity = int64(GetTotalUsableCapacity(info.Disks, info))

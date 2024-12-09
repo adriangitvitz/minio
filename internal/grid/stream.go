@@ -41,7 +41,8 @@ type Stream struct {
 	// Requests sent cannot be used any further by the called.
 	Requests chan<- []byte
 
-	ctx context.Context
+	muxID uint64
+	ctx   context.Context
 }
 
 // Send a payload to the remote server.
@@ -63,31 +64,51 @@ func (s *Stream) Send(b []byte) error {
 func (s *Stream) Results(next func(b []byte) error) (err error) {
 	done := false
 	defer func() {
+		if s.cancel != nil {
+			s.cancel(err)
+		}
+
 		if !done {
-			if s.cancel != nil {
-				s.cancel(err)
-			}
 			// Drain channel.
 			for range s.responses {
 			}
 		}
 	}()
+	doneCh := s.ctx.Done()
 	for {
 		select {
-		case <-s.ctx.Done():
-			return context.Cause(s.ctx)
+		case <-doneCh:
+			if err := context.Cause(s.ctx); !errors.Is(err, errStreamEOF) {
+				return err
+			}
+			// Fall through to be sure we have returned all responses.
+			doneCh = nil
 		case resp, ok := <-s.responses:
 			if !ok {
 				done = true
 				return nil
 			}
 			if resp.Err != nil {
+				s.cancel(resp.Err)
 				return resp.Err
 			}
 			err = next(resp.Msg)
 			if err != nil {
+				s.cancel(err)
 				return err
 			}
 		}
 	}
+}
+
+// Done will return a channel that will be closed when the stream is done.
+// This mirrors context.Done().
+func (s *Stream) Done() <-chan struct{} {
+	return s.ctx.Done()
+}
+
+// Err will return the error that caused the stream to end.
+// This mirrors context.Err().
+func (s *Stream) Err() error {
+	return s.ctx.Err()
 }

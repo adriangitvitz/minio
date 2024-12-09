@@ -26,7 +26,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
 
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // Validate all the ListObjects query arguments, returns an APIErrorCode
@@ -111,7 +111,7 @@ func (api objectAPIHandlers) listObjectVersionsHandler(w http.ResponseWriter, r 
 
 	listObjectVersions := objectAPI.ListObjectVersions
 
-	// Inititate a list object versions operation based on the input params.
+	// Initiate a list object versions operation based on the input params.
 	// On success would return back ListObjectsInfo object to be
 	// marshaled into S3 compatible XML header.
 	listObjectVersionsInfo, err := listObjectVersions(ctx, bucket, prefix, marker, versionIDMarker, delimiter, maxkeys)
@@ -124,7 +124,7 @@ func (api objectAPIHandlers) listObjectVersionsHandler(w http.ResponseWriter, r 
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
-	response := generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delimiter, encodingType, maxkeys, listObjectVersionsInfo, checkObjMeta)
+	response := generateListVersionsResponse(ctx, bucket, prefix, marker, versionIDMarker, delimiter, encodingType, maxkeys, listObjectVersionsInfo, checkObjMeta)
 
 	// Write success response.
 	writeSuccessResponseXML(w, encodeResponseList(response))
@@ -201,10 +201,10 @@ func (api objectAPIHandlers) listObjectsV2Handler(ctx context.Context, w http.Re
 	)
 
 	if r.Header.Get(xMinIOExtract) == "true" && strings.Contains(prefix, archivePattern) {
-		// Inititate a list objects operation inside a zip file based in the input params
-		listObjectsV2Info, err = listObjectsV2InArchive(ctx, objectAPI, bucket, prefix, token, delimiter, maxKeys, fetchOwner, startAfter)
+		// Initiate a list objects operation inside a zip file based in the input params
+		listObjectsV2Info, err = listObjectsV2InArchive(ctx, objectAPI, bucket, prefix, token, delimiter, maxKeys, startAfter, r.Header)
 	} else {
-		// Inititate a list objects operation based on the input params.
+		// Initiate a list objects operation based on the input params.
 		// On success would return back ListObjectsInfo object to be
 		// marshaled into S3 compatible XML header.
 		listObjectsV2Info, err = objectAPI.ListObjectsV2(ctx, bucket, prefix, token, delimiter, maxKeys, fetchOwner, startAfter)
@@ -219,7 +219,7 @@ func (api objectAPIHandlers) listObjectsV2Handler(ctx context.Context, w http.Re
 		return
 	}
 
-	response := generateListObjectsV2Response(bucket, prefix, token, listObjectsV2Info.NextContinuationToken, startAfter,
+	response := generateListObjectsV2Response(ctx, bucket, prefix, token, listObjectsV2Info.NextContinuationToken, startAfter,
 		delimiter, encodingType, fetchOwner, listObjectsV2Info.IsTruncated,
 		maxKeys, listObjectsV2Info.Objects, listObjectsV2Info.Prefixes, checkObjMeta)
 
@@ -231,7 +231,7 @@ func parseRequestToken(token string) (subToken string, nodeIndex int) {
 	if token == "" {
 		return token, -1
 	}
-	i := strings.Index(token, ":")
+	i := strings.Index(token, getKeySeparator())
 	if i < 0 {
 		return token, -1
 	}
@@ -245,7 +245,7 @@ func parseRequestToken(token string) (subToken string, nodeIndex int) {
 
 func proxyRequestByToken(ctx context.Context, w http.ResponseWriter, r *http.Request, token string) (string, bool) {
 	subToken, nodeIndex := parseRequestToken(token)
-	if nodeIndex > 0 {
+	if nodeIndex >= 0 {
 		return subToken, proxyRequestByNodeIndex(ctx, w, r, nodeIndex)
 	}
 	return subToken, false
@@ -289,7 +289,7 @@ func (api objectAPIHandlers) ListObjectsV1Handler(w http.ResponseWriter, r *http
 		return
 	}
 
-	// Extract all the litsObjectsV1 query params to their native values.
+	// Extract all the listObjectsV1 query params to their native values.
 	prefix, marker, delimiter, maxKeys, encodingType, s3Error := getListObjectsV1Args(r.Form)
 	if s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
@@ -304,7 +304,7 @@ func (api objectAPIHandlers) ListObjectsV1Handler(w http.ResponseWriter, r *http
 
 	listObjects := objectAPI.ListObjects
 
-	// Inititate a list objects operation based on the input params.
+	// Initiate a list objects operation based on the input params.
 	// On success would return back ListObjectsInfo object to be
 	// marshaled into S3 compatible XML header.
 	listObjectsInfo, err := listObjects(ctx, bucket, prefix, marker, delimiter, maxKeys)
@@ -318,7 +318,7 @@ func (api objectAPIHandlers) ListObjectsV1Handler(w http.ResponseWriter, r *http
 		return
 	}
 
-	response := generateListObjectsV1Response(bucket, prefix, marker, delimiter, encodingType, maxKeys, listObjectsInfo)
+	response := generateListObjectsV1Response(ctx, bucket, prefix, marker, delimiter, encodingType, maxKeys, listObjectsInfo)
 
 	// Write success response.
 	writeSuccessResponseXML(w, encodeResponseList(response))

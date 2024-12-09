@@ -26,9 +26,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	_ "github.com/lib/pq" // Register postgres driver
 
@@ -36,7 +38,7 @@ import (
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/v2/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 const (
@@ -101,6 +103,10 @@ func (p PostgreSQLArgs) Validate() error {
 	if p.Table == "" {
 		return fmt.Errorf("empty table name")
 	}
+	if err := validatePsqlTableName(p.Table); err != nil {
+		return err
+	}
+
 	if p.Format != "" {
 		f := strings.ToLower(p.Format)
 		if f != event.NamespaceFormat && f != event.AccessFormat {
@@ -190,7 +196,8 @@ func (target *PostgreSQLTarget) isActive() (bool, error) {
 // Save - saves the events to the store if questore is configured, which will be replayed when the PostgreSQL connection is active.
 func (target *PostgreSQLTarget) Save(eventData event.Event) error {
 	if target.store != nil {
-		return target.store.Put(eventData)
+		_, err := target.store.Put(eventData)
+		return err
 	}
 
 	if err := target.init(); err != nil {
@@ -269,7 +276,7 @@ func (target *PostgreSQLTarget) SendFromStore(key store.Key) error {
 		}
 	}
 
-	eventData, eErr := target.store.Get(key.Name)
+	eventData, eErr := target.store.Get(key)
 	if eErr != nil {
 		// The last event key in a successful batch will be sent in the channel atmost once by the replayEvents()
 		// Such events will not exist and wouldve been already been sent successfully.
@@ -287,7 +294,7 @@ func (target *PostgreSQLTarget) SendFromStore(key store.Key) error {
 	}
 
 	// Delete the event from store.
-	return target.store.Del(key.Name)
+	return target.store.Del(key)
 }
 
 // Close - closes underneath connections to PostgreSQL database.
@@ -443,4 +450,44 @@ func NewPostgreSQLTarget(id string, args PostgreSQLArgs, loggerOnce logger.LogOn
 	}
 
 	return target, nil
+}
+
+var errInvalidPsqlTablename = errors.New("invalid PostgreSQL table")
+
+func validatePsqlTableName(name string) error {
+	// check for quoted string (string may not contain a quote)
+	if match, err := regexp.MatchString("^\"[^\"]+\"$", name); err != nil {
+		return err
+	} else if match {
+		return nil
+	}
+
+	// normalize the name to letters, digits, _ or $
+	valid := true
+	cleaned := strings.Map(func(r rune) rune {
+		switch {
+		case unicode.IsLetter(r):
+			return 'a'
+		case unicode.IsDigit(r):
+			return '0'
+		case r == '_', r == '$':
+			return r
+		default:
+			valid = false
+			return -1
+		}
+	}, name)
+
+	if valid {
+		// check for simple name or quoted name
+		// - letter/underscore followed by one or more letter/digit/underscore
+		// - any text between quotes (text cannot contain a quote itself)
+		if match, err := regexp.MatchString("^[a_][a0_$]*$", cleaned); err != nil {
+			return err
+		} else if match {
+			return nil
+		}
+	}
+
+	return errInvalidPsqlTablename
 }

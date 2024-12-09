@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/pkg/v2/env"
+	"github.com/minio/pkg/v3/env"
 )
 
 // Compression environment variables
@@ -63,11 +63,9 @@ type Config struct {
 }
 
 // BitrotScanCycle returns the configured cycle for the scanner healing
-// -1 for not enabled
-//
-//	0 for contiunous bitrot scanning
-//
-// >0 interval duration between cycles
+// - '-1' for not enabled
+// - '0' for continuous bitrot scanning
+// - '> 0' interval duration between cycles
 func (opts Config) BitrotScanCycle() (d time.Duration) {
 	configMutex.RLock()
 	defer configMutex.RUnlock()
@@ -157,11 +155,14 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 	if err = config.CheckValidKeys(config.HealSubSys, kvs, DefaultKVS); err != nil {
 		return cfg, err
 	}
-	cfg.Bitrot = env.Get(EnvBitrot, kvs.GetWithDefault(Bitrot, DefaultKVS))
-	_, err = parseBitrotConfig(cfg.Bitrot)
-	if err != nil {
+
+	bitrot := env.Get(EnvBitrot, kvs.GetWithDefault(Bitrot, DefaultKVS))
+	if _, err = parseBitrotConfig(bitrot); err != nil {
 		return cfg, fmt.Errorf("'heal:bitrotscan' value invalid: %w", err)
 	}
+
+	cfg.Bitrot = bitrot
+
 	cfg.Sleep, err = time.ParseDuration(env.Get(EnvSleep, kvs.GetWithDefault(Sleep, DefaultKVS)))
 	if err != nil {
 		return cfg, fmt.Errorf("'heal:max_sleep' value invalid: %w", err)

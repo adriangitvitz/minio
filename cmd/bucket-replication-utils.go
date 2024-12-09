@@ -219,7 +219,7 @@ type ReplicateDecision struct {
 	targetsMap map[string]replicateTargetDecision
 }
 
-// ReplicateAny returns true if atleast one target qualifies for replication
+// ReplicateAny returns true if at least one target qualifies for replication
 func (d ReplicateDecision) ReplicateAny() bool {
 	for _, t := range d.targetsMap {
 		if t.Replicate {
@@ -229,7 +229,7 @@ func (d ReplicateDecision) ReplicateAny() bool {
 	return false
 }
 
-// Synchronous returns true if atleast one target qualifies for synchronous replication
+// Synchronous returns true if at least one target qualifies for synchronous replication
 func (d ReplicateDecision) Synchronous() bool {
 	for _, t := range d.targetsMap {
 		if t.Synchronous {
@@ -336,7 +336,7 @@ type ReplicationState struct {
 	DeleteMarker              bool                   // represents DeleteMarker replication state
 	ReplicationTimeStamp      time.Time              // timestamp when last replication activity happened
 	ReplicationStatusInternal string                 // stringified representation of all replication activity
-	// VersionPurgeStatusInternal is internally in the format "arn1=PENDING;arn2=COMMPLETED;"
+	// VersionPurgeStatusInternal is internally in the format "arn1=PENDING;arn2=COMPLETED;"
 	VersionPurgeStatusInternal string                            // stringified representation of all version purge statuses
 	ReplicateDecisionStr       string                            // stringified representation of replication decision for each target
 	Targets                    map[string]replication.StatusType // map of ARN->replication status for ongoing replication activity
@@ -534,7 +534,7 @@ func getHealReplicateObjectInfo(oi ObjectInfo, rcfg replicationConfig) Replicate
 	rstate.ReplicateDecisionStr = dsc.String()
 	asz, _ := oi.GetActualSize()
 
-	return ReplicateObjectInfo{
+	r := ReplicateObjectInfo{
 		Name:                       oi.Name,
 		Size:                       oi.Size,
 		ActualSize:                 asz,
@@ -558,6 +558,10 @@ func getHealReplicateObjectInfo(oi ObjectInfo, rcfg replicationConfig) Replicate
 		SSEC:                 crypto.SSEC.IsEncrypted(oi.UserDefined),
 		UserTags:             oi.UserTags,
 	}
+	if r.SSEC {
+		r.Checksum = oi.Checksum
+	}
+	return r
 }
 
 // ReplicationState - returns replication state using other internal replication metadata in ObjectInfo

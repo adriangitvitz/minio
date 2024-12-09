@@ -55,12 +55,7 @@ spec:
       {{- end }}
       {{- if and .Values.securityContext.enabled .Values.persistence.enabled }}
       securityContext:
-        runAsUser: {{ .Values.securityContext.runAsUser }}
-        runAsGroup: {{ .Values.securityContext.runAsGroup }}
-        fsGroup: {{ .Values.securityContext.fsGroup }}
-        {{- if and (ge .Capabilities.KubeVersion.Major "1") (ge .Capabilities.KubeVersion.Minor "20") }}
-        fsGroupChangePolicy: {{ .Values.securityContext.fsGroupChangePolicy }}
-        {{- end }}
+        {{ omit .Values.securityContext "enabled" | toYaml | nindent 8 }}
       {{- end }}
       {{ if .Values.serviceAccount.create }}
       serviceAccountName: {{ .Values.serviceAccount.name }}
@@ -118,7 +113,14 @@ spec:
             - name: MINIO_IDENTITY_OPENID_CONFIG_URL
               value: {{ .Values.oidc.configUrl }}
             - name: MINIO_IDENTITY_OPENID_CLIENT_ID
+            {{- if and .Values.oidc.existingClientSecretName .Values.oidc.existingClientIdKey }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.oidc.existingClientSecretName }}
+                  key: {{ .Values.oidc.existingClientIdKey }}
+            {{- else }}
               value: {{ .Values.oidc.clientId }}
+            {{- end }}
             - name: MINIO_IDENTITY_OPENID_CLIENT_SECRET
             {{- if and .Values.oidc.existingClientSecretName .Values.oidc.existingClientSecretKey }}
               valueFrom:
@@ -138,6 +140,8 @@ spec:
               value: {{ .Values.oidc.comment }}
             - name: MINIO_IDENTITY_OPENID_REDIRECT_URI
               value: {{ .Values.oidc.redirectUri }}
+            - name: MINIO_IDENTITY_OPENID_DISPLAY_NAME
+              value: {{ .Values.oidc.displayName }}
             {{- end }}
             {{- if .Values.etcd.endpoints }}
             - name: MINIO_ETCD_ENDPOINTS
@@ -164,6 +168,11 @@ spec:
               value: {{ tpl $val $ | quote }}
             {{- end }}
           resources: {{- toYaml .Values.resources | nindent 12 }}
+          {{- if and .Values.securityContext.enabled .Values.persistence.enabled }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext: {{ toYaml . | nindent 12}}
+          {{- end }}
+          {{- end }}
         {{- with .Values.extraContainers }}
           {{- if eq (typeOf .) "string" }}
             {{- tpl . $ | nindent 8 }}

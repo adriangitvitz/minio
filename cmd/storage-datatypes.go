@@ -19,15 +19,40 @@ package cmd
 
 import (
 	"time"
+
+	"github.com/minio/minio/internal/crypto"
+	"github.com/minio/minio/internal/grid"
+	xioutil "github.com/minio/minio/internal/ioutil"
 )
+
+//msgp:clearomitted
+
+//go:generate msgp -file=$GOFILE
 
 // DeleteOptions represents the disk level delete options available for the APIs
 type DeleteOptions struct {
+	BaseOptions
 	Recursive bool `msg:"r"`
 	Immediate bool `msg:"i"`
+	UndoWrite bool `msg:"u"`
+	// OldDataDir of the previous object
+	OldDataDir string `msg:"o,omitempty"` // old data dir used only when to revert a rename()
 }
 
-//go:generate msgp -file=$GOFILE
+// BaseOptions represents common options for all Storage API calls
+type BaseOptions struct{}
+
+// RenameOptions represents rename API options, currently its same as BaseOptions
+type RenameOptions struct {
+	BaseOptions
+}
+
+// DiskInfoOptions options for requesting custom results.
+type DiskInfoOptions struct {
+	DiskID  string `msg:"id"`
+	Metrics bool   `msg:"m"`
+	NoOp    bool   `msg:"np"`
+}
 
 // DiskInfo is an extended type which returns current
 // disk usage per path.
@@ -63,8 +88,11 @@ type DiskInfo struct {
 type DiskMetrics struct {
 	LastMinute              map[string]AccElem `json:"apiLatencies,omitempty"`
 	APICalls                map[string]uint64  `json:"apiCalls,omitempty"`
+	TotalWaiting            uint32             `json:"totalWaiting,omitempty"`
 	TotalErrorsAvailability uint64             `json:"totalErrsAvailability"`
 	TotalErrorsTimeout      uint64             `json:"totalErrsTimeout"`
+	TotalWrites             uint64             `json:"totalWrites"`
+	TotalDeletes            uint64             `json:"totalDeletes"`
 }
 
 // VolsInfo is a collection of volume(bucket) information
@@ -128,6 +156,15 @@ func (f *FileInfoVersions) findVersionIndex(v string) int {
 	if f == nil || v == "" {
 		return -1
 	}
+	if v == nullVersionID {
+		for i, ver := range f.Versions {
+			if ver.VersionID == "" {
+				return i
+			}
+		}
+		return -1
+	}
+
 	for i, ver := range f.Versions {
 		if ver.VersionID == v {
 			return i
@@ -142,11 +179,6 @@ func (f *FileInfoVersions) findVersionIndex(v string) int {
 type RawFileInfo struct {
 	// Content of entire xl.meta (may contain data depending on what was requested by the caller.
 	Buf []byte `msg:"b,allownil"`
-
-	// DiskMTime indicates the mtime of the xl.meta on disk
-	// This is mainly used for detecting a particular issue
-	// reported in https://github.com/minio/minio/pull/13803
-	DiskMTime time.Time `msg:"dmt"`
 }
 
 // FileInfo - represents file stat information.
@@ -227,16 +259,29 @@ type FileInfo struct {
 	// usage in other calls in undefined please avoid.
 	Idx int `msg:"i"`
 
-	// DiskMTime indicates the mtime of the xl.meta on disk
-	// This is mainly used for detecting a particular issue
-	// reported in https://github.com/minio/minio/pull/13803
-	DiskMTime time.Time `msg:"dmt"`
-
 	// Combined checksum when object was uploaded.
 	Checksum []byte `msg:"cs,allownil"`
 
 	// Versioned - indicates if this file is versioned or not.
 	Versioned bool `msg:"vs"`
+}
+
+func (fi FileInfo) shardSize() int64 {
+	return ceilFrac(fi.Erasure.BlockSize, int64(fi.Erasure.DataBlocks))
+}
+
+// ShardFileSize - returns final erasure size from original size.
+func (fi FileInfo) ShardFileSize(totalLength int64) int64 {
+	if totalLength == 0 {
+		return 0
+	}
+	if totalLength == -1 {
+		return -1
+	}
+	numShards := totalLength / fi.Erasure.BlockSize
+	lastBlockSize := totalLength % fi.Erasure.BlockSize
+	lastShardSize := ceilFrac(lastBlockSize, int64(fi.Erasure.DataBlocks))
+	return numShards*fi.shardSize() + lastShardSize
 }
 
 // ShallowCopy - copies minimal information for READ MRF checks.
@@ -271,10 +316,15 @@ func (fi FileInfo) ReadQuorum(dquorum int) int {
 
 // Equals checks if fi(FileInfo) matches ofi(FileInfo)
 func (fi FileInfo) Equals(ofi FileInfo) (ok bool) {
-	if !fi.MetadataEquals(ofi) {
+	typ1, ok1 := crypto.IsEncrypted(fi.Metadata)
+	typ2, ok2 := crypto.IsEncrypted(ofi.Metadata)
+	if ok1 != ok2 {
 		return false
 	}
-	if !fi.ReplicationInfoEquals(ofi) {
+	if typ1 != typ2 {
+		return false
+	}
+	if fi.IsCompressed() != ofi.IsCompressed() {
 		return false
 	}
 	if !fi.TransitionInfoEquals(ofi) {
@@ -299,6 +349,12 @@ func (fi FileInfo) GetDataDir() string {
 		return "legacy"
 	}
 	return fi.DataDir
+}
+
+// IsCompressed returns true if the object is marked as compressed.
+func (fi FileInfo) IsCompressed() bool {
+	_, ok := fi.Metadata[ReservedMetadataPrefix+"compression"]
+	return ok
 }
 
 // InlineData returns true if object contents are inlined alongside its metadata.
@@ -338,39 +394,41 @@ func newFileInfo(object string, dataBlocks, parityBlocks int) (fi FileInfo) {
 
 // ReadMultipleReq contains information of multiple files to read from disk.
 type ReadMultipleReq struct {
-	Bucket       string   // Bucket. Can be empty if multiple buckets.
-	Prefix       string   // Shared prefix of all files. Can be empty. Will be joined to filename without modification.
-	Files        []string // Individual files to read.
-	MaxSize      int64    // Return error if size is exceed.
-	MetadataOnly bool     // Read as XL meta and truncate data.
-	AbortOn404   bool     // Stop reading after first file not found.
-	MaxResults   int      // Stop after this many successful results. <= 0 means all.
+	Bucket       string   `msg:"bk"`           // Bucket. Can be empty if multiple buckets.
+	Prefix       string   `msg:"pr,omitempty"` // Shared prefix of all files. Can be empty. Will be joined to filename without modification.
+	Files        []string `msg:"fl"`           // Individual files to read.
+	MaxSize      int64    `msg:"ms"`           // Return error if size is exceed.
+	MetadataOnly bool     `msg:"mo"`           // Read as XL meta and truncate data.
+	AbortOn404   bool     `msg:"ab"`           // Stop reading after first file not found.
+	MaxResults   int      `msg:"mr"`           // Stop after this many successful results. <= 0 means all.
 }
 
 // ReadMultipleResp contains a single response from a ReadMultipleReq.
 type ReadMultipleResp struct {
-	Bucket  string    // Bucket as given by request.
-	Prefix  string    // Prefix as given by request.
-	File    string    // File name as given in request.
-	Exists  bool      // Returns whether the file existed on disk.
-	Error   string    // Returns any error when reading.
-	Data    []byte    // Contains all data of file.
-	Modtime time.Time // Modtime of file on disk.
+	Bucket  string    `msg:"bk"`           // Bucket as given by request.
+	Prefix  string    `msg:"pr,omitempty"` // Prefix as given by request.
+	File    string    `msg:"fl"`           // File name as given in request.
+	Exists  bool      `msg:"ex"`           // Returns whether the file existed on disk.
+	Error   string    `msg:"er,omitempty"` // Returns any error when reading.
+	Data    []byte    `msg:"d"`            // Contains all data of file.
+	Modtime time.Time `msg:"m"`            // Modtime of file on disk.
 }
 
 // DeleteVersionHandlerParams are parameters for DeleteVersionHandler
 type DeleteVersionHandlerParams struct {
-	DiskID         string   `msg:"id"`
-	Volume         string   `msg:"v"`
-	FilePath       string   `msg:"fp"`
-	ForceDelMarker bool     `msg:"fdm"`
-	FI             FileInfo `msg:"fi"`
+	DiskID         string        `msg:"id"`
+	Volume         string        `msg:"v"`
+	FilePath       string        `msg:"fp"`
+	ForceDelMarker bool          `msg:"fdm"`
+	Opts           DeleteOptions `msg:"do"`
+	FI             FileInfo      `msg:"fi"`
 }
 
 // MetadataHandlerParams is request info for UpdateMetadataHandle and WriteMetadataHandler.
 type MetadataHandlerParams struct {
 	DiskID     string             `msg:"id"`
 	Volume     string             `msg:"v"`
+	OrigVolume string             `msg:"ov"`
 	FilePath   string             `msg:"fp"`
 	UpdateOpts UpdateMetadataOpts `msg:"uo"`
 	FI         FileInfo           `msg:"fi"`
@@ -399,15 +457,125 @@ type DeleteFileHandlerParams struct {
 
 // RenameDataHandlerParams are parameters for RenameDataHandler.
 type RenameDataHandlerParams struct {
-	DiskID    string   `msg:"id"`
-	SrcVolume string   `msg:"sv"`
-	SrcPath   string   `msg:"sp"`
-	DstVolume string   `msg:"dv"`
-	DstPath   string   `msg:"dp"`
-	FI        FileInfo `msg:"fi"`
+	DiskID    string        `msg:"id"`
+	SrcVolume string        `msg:"sv"`
+	SrcPath   string        `msg:"sp"`
+	DstVolume string        `msg:"dv"`
+	DstPath   string        `msg:"dp"`
+	FI        FileInfo      `msg:"fi"`
+	Opts      RenameOptions `msg:"ro"`
+}
+
+// RenameDataInlineHandlerParams are parameters for RenameDataHandler with a buffer for inline data.
+type RenameDataInlineHandlerParams struct {
+	RenameDataHandlerParams `msg:"p"`
+}
+
+func newRenameDataInlineHandlerParams() *RenameDataInlineHandlerParams {
+	buf := grid.GetByteBufferCap(32 + 16<<10)
+	return &RenameDataInlineHandlerParams{RenameDataHandlerParams{FI: FileInfo{Data: buf[:0]}}}
+}
+
+// Recycle will reuse the memory allocated for the FileInfo data.
+func (r *RenameDataInlineHandlerParams) Recycle() {
+	if r == nil {
+		return
+	}
+	if cap(r.FI.Data) >= xioutil.SmallBlock {
+		grid.PutByteBuffer(r.FI.Data)
+		r.FI.Data = nil
+	}
+}
+
+// RenameFileHandlerParams are parameters for RenameFileHandler.
+type RenameFileHandlerParams struct {
+	DiskID      string `msg:"id"`
+	SrcVolume   string `msg:"sv"`
+	SrcFilePath string `msg:"sp"`
+	DstVolume   string `msg:"dv"`
+	DstFilePath string `msg:"dp"`
+}
+
+// RenamePartHandlerParams are parameters for RenamePartHandler.
+type RenamePartHandlerParams struct {
+	DiskID      string `msg:"id"`
+	SrcVolume   string `msg:"sv"`
+	SrcFilePath string `msg:"sp"`
+	DstVolume   string `msg:"dv"`
+	DstFilePath string `msg:"dp"`
+	Meta        []byte `msg:"m"`
+}
+
+// ReadAllHandlerParams are parameters for ReadAllHandler.
+type ReadAllHandlerParams struct {
+	DiskID   string `msg:"id"`
+	Volume   string `msg:"v"`
+	FilePath string `msg:"fp"`
+}
+
+// WriteAllHandlerParams are parameters for WriteAllHandler.
+type WriteAllHandlerParams struct {
+	DiskID   string `msg:"id"`
+	Volume   string `msg:"v"`
+	FilePath string `msg:"fp"`
+	Buf      []byte `msg:"b"`
 }
 
 // RenameDataResp - RenameData()'s response.
+// Provides information about the final state of Rename()
+//   - on xl.meta (array of versions) on disk to check for version disparity
+//   - on rewrite dataDir on disk that must be additionally purged
+//     only after as a 2-phase call, allowing the older dataDir to
+//     hang-around in-case we need some form of recovery.
 type RenameDataResp struct {
-	Signature uint64 `msg:"sig"`
+	Sign       []byte `msg:"s"`
+	OldDataDir string `msg:"od"` // contains '<uuid>', it is designed to be passed as value to Delete(bucket, pathJoin(object, dataDir))
+}
+
+const (
+	checkPartUnknown int = iota
+
+	// Changing the order can cause a data loss
+	// when running two nodes with incompatible versions
+	checkPartSuccess
+	checkPartDiskNotFound
+	checkPartVolumeNotFound
+	checkPartFileNotFound
+	checkPartFileCorrupt
+)
+
+// CheckPartsResp is a response of the storage CheckParts and VerifyFile APIs
+type CheckPartsResp struct {
+	Results []int `msg:"r"`
+}
+
+// LocalDiskIDs - GetLocalIDs response.
+type LocalDiskIDs struct {
+	IDs []string `msg:"i"`
+}
+
+// ListDirResult - ListDir()'s response.
+type ListDirResult struct {
+	Entries []string `msg:"e"`
+}
+
+// ReadPartsReq - send multiple part paths to read from
+type ReadPartsReq struct {
+	Paths []string `msg:"p"`
+}
+
+// ReadPartsResp - is the response for ReadPartsReq
+type ReadPartsResp struct {
+	Infos []*ObjectPartInfo `msg:"is"`
+}
+
+// DeleteBulkReq - send multiple paths in same delete request.
+type DeleteBulkReq struct {
+	Paths []string `msg:"p"`
+}
+
+// DeleteVersionsErrsResp - collection of delete errors
+// for bulk version deletes
+type DeleteVersionsErrsResp struct {
+	Errs []string `msg:"e"`
 }

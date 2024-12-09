@@ -21,24 +21,25 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/minio/minio/internal/config"
-	"github.com/minio/pkg/v2/env"
+	"github.com/minio/pkg/v3/env"
 )
 
 // API sub-system constants
 const (
 	apiRequestsMax             = "requests_max"
-	apiRequestsDeadline        = "requests_deadline"
 	apiClusterDeadline         = "cluster_deadline"
 	apiCorsAllowOrigin         = "cors_allow_origin"
 	apiRemoteTransportDeadline = "remote_transport_deadline"
 	apiListQuorum              = "list_quorum"
 	apiReplicationPriority     = "replication_priority"
 	apiReplicationMaxWorkers   = "replication_max_workers"
+	apiReplicationMaxLWorkers  = "replication_max_lrg_workers"
 
 	apiTransitionWorkers           = "transition_workers"
 	apiStaleUploadsCleanupInterval = "stale_uploads_cleanup_interval"
@@ -49,17 +50,20 @@ const (
 	apiGzipObjects                 = "gzip_objects"
 	apiRootAccess                  = "root_access"
 	apiSyncEvents                  = "sync_events"
+	apiObjectMaxVersions           = "object_max_versions"
 
-	EnvAPIRequestsMax                 = "MINIO_API_REQUESTS_MAX"
-	EnvAPIRequestsDeadline            = "MINIO_API_REQUESTS_DEADLINE"
-	EnvAPIClusterDeadline             = "MINIO_API_CLUSTER_DEADLINE"
-	EnvAPICorsAllowOrigin             = "MINIO_API_CORS_ALLOW_ORIGIN"
-	EnvAPIRemoteTransportDeadline     = "MINIO_API_REMOTE_TRANSPORT_DEADLINE"
-	EnvAPITransitionWorkers           = "MINIO_API_TRANSITION_WORKERS"
-	EnvAPIListQuorum                  = "MINIO_API_LIST_QUORUM"
-	EnvAPISecureCiphers               = "MINIO_API_SECURE_CIPHERS" // default config.EnableOn
-	EnvAPIReplicationPriority         = "MINIO_API_REPLICATION_PRIORITY"
-	EnvAPIReplicationMaxWorkers       = "MINIO_API_REPLICATION_MAX_WORKERS"
+	EnvAPIRequestsMax             = "MINIO_API_REQUESTS_MAX"
+	EnvAPIRequestsDeadline        = "MINIO_API_REQUESTS_DEADLINE"
+	EnvAPIClusterDeadline         = "MINIO_API_CLUSTER_DEADLINE"
+	EnvAPICorsAllowOrigin         = "MINIO_API_CORS_ALLOW_ORIGIN"
+	EnvAPIRemoteTransportDeadline = "MINIO_API_REMOTE_TRANSPORT_DEADLINE"
+	EnvAPITransitionWorkers       = "MINIO_API_TRANSITION_WORKERS"
+	EnvAPIListQuorum              = "MINIO_API_LIST_QUORUM"
+	EnvAPISecureCiphers           = "MINIO_API_SECURE_CIPHERS" // default config.EnableOn
+	EnvAPIReplicationPriority     = "MINIO_API_REPLICATION_PRIORITY"
+	EnvAPIReplicationMaxWorkers   = "MINIO_API_REPLICATION_MAX_WORKERS"
+	EnvAPIReplicationMaxLWorkers  = "MINIO_API_REPLICATION_MAX_LRG_WORKERS"
+
 	EnvAPIStaleUploadsCleanupInterval = "MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL"
 	EnvAPIStaleUploadsExpiry          = "MINIO_API_STALE_UPLOADS_EXPIRY"
 	EnvAPIDeleteCleanupInterval       = "MINIO_API_DELETE_CLEANUP_INTERVAL"
@@ -69,11 +73,14 @@ const (
 	EnvAPIGzipObjects                 = "MINIO_API_GZIP_OBJECTS"
 	EnvAPIRootAccess                  = "MINIO_API_ROOT_ACCESS" // default config.EnableOn
 	EnvAPISyncEvents                  = "MINIO_API_SYNC_EVENTS" // default "off"
+	EnvAPIObjectMaxVersions           = "MINIO_API_OBJECT_MAX_VERSIONS"
+	EnvAPIObjectMaxVersionsLegacy     = "_MINIO_OBJECT_MAX_VERSIONS"
 )
 
 // Deprecated key and ENVs
 const (
 	apiReadyDeadline            = "ready_deadline"
+	apiRequestsDeadline         = "requests_deadline"
 	apiReplicationWorkers       = "replication_workers"
 	apiReplicationFailedWorkers = "replication_failed_workers"
 )
@@ -84,10 +91,6 @@ var (
 		config.KV{
 			Key:   apiRequestsMax,
 			Value: "0",
-		},
-		config.KV{
-			Key:   apiRequestsDeadline,
-			Value: "10s",
 		},
 		config.KV{
 			Key:   apiClusterDeadline,
@@ -114,6 +117,10 @@ var (
 			Value: "500",
 		},
 		config.KV{
+			Key:   apiReplicationMaxLWorkers,
+			Value: "10",
+		},
+		config.KV{
 			Key:   apiTransitionWorkers,
 			Value: "100",
 		},
@@ -130,9 +137,9 @@ var (
 			Value: "5m",
 		},
 		config.KV{
-			Key:        apiDisableODirect,
-			Value:      "",
-			Deprecated: true,
+			Key:           apiDisableODirect,
+			Value:         "",
+			HiddenIfEmpty: true,
 		},
 		config.KV{
 			Key:   apiODirect,
@@ -150,19 +157,23 @@ var (
 			Key:   apiSyncEvents,
 			Value: config.EnableOff,
 		},
+		config.KV{
+			Key:   apiObjectMaxVersions,
+			Value: "9223372036854775807",
+		},
 	}
 )
 
 // Config storage class configuration
 type Config struct {
 	RequestsMax                 int           `json:"requests_max"`
-	RequestsDeadline            time.Duration `json:"requests_deadline"`
 	ClusterDeadline             time.Duration `json:"cluster_deadline"`
 	CorsAllowOrigin             []string      `json:"cors_allow_origin"`
 	RemoteTransportDeadline     time.Duration `json:"remote_transport_deadline"`
 	ListQuorum                  string        `json:"list_quorum"`
 	ReplicationPriority         string        `json:"replication_priority"`
 	ReplicationMaxWorkers       int           `json:"replication_max_workers"`
+	ReplicationMaxLWorkers      int           `json:"replication_max_lrg_workers"`
 	TransitionWorkers           int           `json:"transition_workers"`
 	StaleUploadsCleanupInterval time.Duration `json:"stale_uploads_cleanup_interval"`
 	StaleUploadsExpiry          time.Duration `json:"stale_uploads_expiry"`
@@ -171,6 +182,7 @@ type Config struct {
 	GzipObjects                 bool          `json:"gzip_objects"`
 	RootAccess                  bool          `json:"root_access"`
 	SyncEvents                  bool          `json:"sync_events"`
+	ObjectMaxVersions           int64         `json:"object_max_versions"`
 }
 
 // UnmarshalJSON - Validate SS and RRS parity when unmarshalling JSON.
@@ -188,9 +200,11 @@ func (sCfg *Config) UnmarshalJSON(data []byte) error {
 func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 	deprecatedKeys := []string{
 		apiReadyDeadline,
+		apiRequestsDeadline,
 		"extend_list_cache_life",
 		apiReplicationWorkers,
 		apiReplicationFailedWorkers,
+		"expiry_workers",
 	}
 
 	disableODirect := env.Get(EnvAPIDisableODirect, kvs.Get(apiDisableODirect)) == config.EnableOn
@@ -233,12 +247,6 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 		return cfg, errors.New("invalid API max requests value")
 	}
 
-	requestsDeadline, err := time.ParseDuration(env.Get(EnvAPIRequestsDeadline, kvs.GetWithDefault(apiRequestsDeadline, DefaultKVS)))
-	if err != nil {
-		return cfg, err
-	}
-	cfg.RequestsDeadline = requestsDeadline
-
 	clusterDeadline, err := time.ParseDuration(env.Get(EnvAPIClusterDeadline, kvs.GetWithDefault(apiClusterDeadline, DefaultKVS)))
 	if err != nil {
 		return cfg, err
@@ -253,7 +261,7 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 
 	listQuorum := env.Get(EnvAPIListQuorum, kvs.GetWithDefault(apiListQuorum, DefaultKVS))
 	switch listQuorum {
-	case "strict", "optimal", "reduced", "disk":
+	case "strict", "optimal", "reduced", "disk", "auto":
 	default:
 		return cfg, fmt.Errorf("invalid value %v for list_quorum: will default to 'strict'", listQuorum)
 	}
@@ -270,11 +278,21 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 	if err != nil {
 		return cfg, err
 	}
-
 	if replicationMaxWorkers <= 0 || replicationMaxWorkers > 500 {
 		return cfg, config.ErrInvalidReplicationWorkersValue(nil).Msg("Number of replication workers should be between 1 and 500")
 	}
 	cfg.ReplicationMaxWorkers = replicationMaxWorkers
+
+	replicationMaxLWorkers, err := strconv.Atoi(env.Get(EnvAPIReplicationMaxLWorkers, kvs.GetWithDefault(apiReplicationMaxLWorkers, DefaultKVS)))
+	if err != nil {
+		return cfg, err
+	}
+	if replicationMaxLWorkers <= 0 || replicationMaxLWorkers > 10 {
+		return cfg, config.ErrInvalidReplicationWorkersValue(nil).Msg("Number of replication workers for transfers >=128MiB should be between 1 and 10 per node")
+	}
+
+	cfg.ReplicationMaxLWorkers = replicationMaxLWorkers
+
 	transitionWorkers, err := strconv.Atoi(env.Get(EnvAPITransitionWorkers, kvs.GetWithDefault(apiTransitionWorkers, DefaultKVS)))
 	if err != nil {
 		return cfg, err
@@ -305,6 +323,23 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 	cfg.StaleUploadsExpiry = staleUploadsExpiry
 
 	cfg.SyncEvents = env.Get(EnvAPISyncEvents, kvs.Get(apiSyncEvents)) == config.EnableOn
+
+	maxVerStr := env.Get(EnvAPIObjectMaxVersions, "")
+	if maxVerStr == "" {
+		maxVerStr = env.Get(EnvAPIObjectMaxVersionsLegacy, kvs.Get(apiObjectMaxVersions))
+	}
+	if maxVerStr != "" {
+		maxVersions, err := strconv.ParseInt(maxVerStr, 10, 64)
+		if err != nil {
+			return cfg, err
+		}
+		if maxVersions <= 0 {
+			return cfg, fmt.Errorf("invalid object max versions value: %v", maxVersions)
+		}
+		cfg.ObjectMaxVersions = maxVersions
+	} else {
+		cfg.ObjectMaxVersions = math.MaxInt64
+	}
 
 	return cfg, nil
 }

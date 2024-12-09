@@ -99,7 +99,7 @@ var errNoSuchPolicy = errors.New("Specified canned policy does not exist")
 var errPolicyInUse = errors.New("Specified policy is in use and cannot be deleted.")
 
 // error returned when more than a single policy is specified when only one is
-// expectd.
+// expected.
 var errTooManyPolicies = errors.New("Only a single policy may be specified here.")
 
 // error returned in IAM subsystem when an external users systems is configured.
@@ -119,3 +119,12 @@ var errInvalidMaxParts = errors.New("Part number is greater than the maximum all
 
 // error returned for session policies > 2048
 var errSessionPolicyTooLarge = errors.New("Session policy should not exceed 2048 characters")
+
+// error returned in SFTP when user used public key without certificate
+var errSftpPublicKeyWithoutCert = errors.New("public key authentication without certificate is not accepted")
+
+// error returned in SFTP when user used certificate which does not contain principal(s)
+var errSftpCertWithoutPrincipals = errors.New("certificates without principal(s) are not accepted")
+
+// error returned when group name contains reserved characters
+var errGroupNameContainsReservedChars = errors.New("Group name contains reserved characters '=' or ','")

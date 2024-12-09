@@ -41,7 +41,7 @@ import (
 	xjwt "github.com/minio/minio/internal/jwt"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mcontext"
-	"github.com/minio/pkg/v2/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // Verify if request has JWT.
@@ -126,7 +126,7 @@ func getRequestAuthType(r *http.Request) (at authType) {
 		var err error
 		r.Form, err = url.ParseQuery(r.URL.RawQuery)
 		if err != nil {
-			logger.LogIf(r.Context(), err)
+			authNLogIf(r.Context(), err)
 			return authTypeUnknown
 		}
 	}
@@ -162,7 +162,8 @@ func validateAdminSignature(ctx context.Context, r *http.Request, region string)
 	s3Err := ErrAccessDenied
 	if _, ok := r.Header[xhttp.AmzContentSha256]; ok &&
 		getRequestAuthType(r) == authTypeSigned {
-		// We only support admin credentials to access admin APIs.
+
+		// Get credential information from the request.
 		cred, owner, s3Err = getReqAccessKeyV4(r, region, serviceS3)
 		if s3Err != ErrNone {
 			return cred, owner, s3Err
@@ -177,7 +178,7 @@ func validateAdminSignature(ctx context.Context, r *http.Request, region string)
 
 	logger.GetReqInfo(ctx).Cred = cred
 	logger.GetReqInfo(ctx).Owner = owner
-	logger.GetReqInfo(ctx).Region = globalSite.Region
+	logger.GetReqInfo(ctx).Region = globalSite.Region()
 
 	return cred, owner, ErrNone
 }
@@ -221,7 +222,7 @@ func mustGetClaimsFromToken(r *http.Request) map[string]interface{} {
 	return claims
 }
 
-func getClaimsFromTokenWithSecret(token, secret string) (map[string]interface{}, error) {
+func getClaimsFromTokenWithSecret(token, secret string) (*xjwt.MapClaims, error) {
 	// JWT token for x-amz-security-token is signed with admin
 	// secret key, temporary credentials become invalid if
 	// server admin credentials change. This is done to ensure
@@ -243,7 +244,7 @@ func getClaimsFromTokenWithSecret(token, secret string) (map[string]interface{},
 
 	// If AuthZPlugin is set, return without any further checks.
 	if newGlobalAuthZPluginFn() != nil {
-		return claims.Map(), nil
+		return claims, nil
 	}
 
 	// Check if a session policy is set. If so, decode it here.
@@ -256,18 +257,22 @@ func getClaimsFromTokenWithSecret(token, secret string) (map[string]interface{},
 		if err != nil {
 			// Base64 decoding fails, we should log to indicate
 			// something is malforming the request sent by client.
-			logger.LogIf(GlobalContext, err, logger.Application)
+			authNLogIf(GlobalContext, err, logger.ErrorKind)
 			return nil, errAuthentication
 		}
 		claims.MapClaims[sessionPolicyNameExtracted] = string(spBytes)
 	}
 
-	return claims.Map(), nil
+	return claims, nil
 }
 
 // Fetch claims in the security token returned by the client.
 func getClaimsFromToken(token string) (map[string]interface{}, error) {
-	return getClaimsFromTokenWithSecret(token, globalActiveCred.SecretKey)
+	jwtClaims, err := getClaimsFromTokenWithSecret(token, globalActiveCred.SecretKey)
+	if err != nil {
+		return nil, err
+	}
+	return jwtClaims.Map(), nil
 }
 
 // Fetch claims in the security token returned by the client and validate the token.
@@ -293,7 +298,21 @@ func checkClaimsFromToken(r *http.Request, cred auth.Credentials) (map[string]in
 		return nil, ErrInvalidToken
 	}
 
+	// Expired credentials must return error right away.
+	if cred.IsTemp() && cred.IsExpired() {
+		return nil, toAPIErrorCode(r.Context(), errInvalidAccessKeyID)
+	}
 	secret := globalActiveCred.SecretKey
+	if globalSiteReplicationSys.isEnabled() && cred.AccessKey != siteReplicatorSvcAcc {
+		nsecret, err := getTokenSigningKey()
+		if err != nil {
+			return nil, toAPIErrorCode(r.Context(), err)
+		}
+		// sign root's temporary accounts also with site replicator creds
+		if cred.ParentUser != globalActiveCred.AccessKey || cred.IsTemp() {
+			secret = nsecret
+		}
+	}
 	if cred.IsServiceAccount() {
 		token = cred.SessionToken
 		secret = cred.SecretKey
@@ -304,7 +323,7 @@ func checkClaimsFromToken(r *http.Request, cred auth.Credentials) (map[string]in
 		if err != nil {
 			return nil, toAPIErrorCode(r.Context(), err)
 		}
-		return claims, ErrNone
+		return claims.Map(), ErrNone
 	}
 
 	claims := xjwt.NewMapClaims()
@@ -338,7 +357,7 @@ func checkRequestAuthTypeWithVID(ctx context.Context, r *http.Request, action po
 
 func authenticateRequest(ctx context.Context, r *http.Request, action policy.Action) (s3Err APIErrorCode) {
 	if logger.GetReqInfo(ctx) == nil {
-		logger.LogIf(ctx, errors.New("unexpected context.Context does not have a logger.ReqInfo"), logger.Minio)
+		bugLogIf(ctx, errors.New("unexpected context.Context does not have a logger.ReqInfo"), logger.ErrorKind)
 		return ErrAccessDenied
 	}
 
@@ -353,7 +372,7 @@ func authenticateRequest(ctx context.Context, r *http.Request, action policy.Act
 		}
 		cred, owner, s3Err = getReqAccessKeyV2(r)
 	case authTypeSigned, authTypePresigned:
-		region := globalSite.Region
+		region := globalSite.Region()
 		switch action {
 		case policy.GetBucketLocationAction, policy.ListAllMyBucketsAction:
 			region = ""
@@ -369,7 +388,7 @@ func authenticateRequest(ctx context.Context, r *http.Request, action policy.Act
 
 	logger.GetReqInfo(ctx).Cred = cred
 	logger.GetReqInfo(ctx).Owner = owner
-	logger.GetReqInfo(ctx).Region = globalSite.Region
+	logger.GetReqInfo(ctx).Region = globalSite.Region()
 
 	// region is valid only for CreateBucketAction.
 	var region string
@@ -377,7 +396,7 @@ func authenticateRequest(ctx context.Context, r *http.Request, action policy.Act
 		// To extract region from XML in request body, get copy of request body.
 		payload, err := io.ReadAll(io.LimitReader(r.Body, maxLocationConstraintSize))
 		if err != nil {
-			logger.LogIf(ctx, err, logger.Application)
+			authZLogIf(ctx, err, logger.ErrorKind)
 			return ErrMalformedXML
 		}
 
@@ -669,7 +688,7 @@ func validateSignature(atype authType, r *http.Request) (auth.Credentials, bool,
 		}
 		cred, owner, s3Err = getReqAccessKeyV2(r)
 	case authTypePresigned, authTypeSigned:
-		region := globalSite.Region
+		region := globalSite.Region()
 		if s3Err = isReqAuthenticated(GlobalContext, r, region, serviceS3); s3Err != ErrNone {
 			return cred, owner, s3Err
 		}
@@ -730,7 +749,7 @@ func isPutRetentionAllowed(bucketName, objectName string, retDays int, retDate t
 func isPutActionAllowed(ctx context.Context, atype authType, bucketName, objectName string, r *http.Request, action policy.Action) (s3Err APIErrorCode) {
 	var cred auth.Credentials
 	var owner bool
-	region := globalSite.Region
+	region := globalSite.Region()
 	switch atype {
 	case authTypeUnknown:
 		return ErrSignatureVersionNotSupported

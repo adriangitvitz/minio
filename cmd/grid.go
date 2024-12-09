@@ -22,7 +22,6 @@ import (
 	"crypto/tls"
 	"sync/atomic"
 
-	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/fips"
 	"github.com/minio/minio/internal/grid"
 	xhttp "github.com/minio/minio/internal/http"
@@ -32,52 +31,77 @@ import (
 // globalGrid is the global grid manager.
 var globalGrid atomic.Pointer[grid.Manager]
 
+// globalLockGrid is the global lock grid manager.
+var globalLockGrid atomic.Pointer[grid.Manager]
+
 // globalGridStart is a channel that will block startup of grid connections until closed.
 var globalGridStart = make(chan struct{})
 
-func initGlobalGrid(ctx context.Context, eps EndpointServerPools) error {
-	seenHosts := set.NewStringSet()
-	var hosts []string
-	var local string
-	for _, ep := range eps {
-		for _, endpoint := range ep.Endpoints {
-			u := endpoint.GridHost()
-			if seenHosts.Contains(u) {
-				continue
-			}
-			seenHosts.Add(u)
+// globalLockGridStart is a channel that will block startup of lock grid connections until closed.
+var globalLockGridStart = make(chan struct{})
 
-			// Set local endpoint
-			if endpoint.IsLocal {
-				local = u
-			}
-			hosts = append(hosts, u)
-		}
-	}
+func initGlobalGrid(ctx context.Context, eps EndpointServerPools) error {
+	hosts, local := eps.GridHosts()
 	lookupHost := globalDNSCache.LookupHost
-	if IsKubernetes() || IsDocker() {
-		lookupHost = nil
-	}
 	g, err := grid.NewManager(ctx, grid.ManagerOptions{
-		Dialer:       grid.ContextDialer(xhttp.DialContextWithLookupHost(lookupHost, xhttp.NewInternodeDialContext(rest.DefaultTimeout, globalTCPOptions))),
+		// Pass Dialer for websocket grid, make sure we do not
+		// provide any DriveOPTimeout() function, as that is not
+		// useful over persistent connections.
+		Dialer: grid.ConnectWS(
+			grid.ContextDialer(xhttp.DialContextWithLookupHost(lookupHost, xhttp.NewInternodeDialContext(rest.DefaultTimeout, globalTCPOptions.ForWebsocket()))),
+			newCachedAuthToken(),
+			&tls.Config{
+				RootCAs:          globalRootCAs,
+				CipherSuites:     fips.TLSCiphers(),
+				CurvePreferences: fips.TLSCurveIDs(),
+			}),
 		Local:        local,
 		Hosts:        hosts,
-		AddAuth:      newCachedAuthToken(),
-		AuthRequest:  storageServerRequestValidate,
+		AuthToken:    validateStorageRequestToken,
+		AuthFn:       newCachedAuthToken(),
 		BlockConnect: globalGridStart,
-		TLSConfig: &tls.Config{
-			RootCAs:          globalRootCAs,
-			CipherSuites:     fips.TLSCiphers(),
-			CurvePreferences: fips.TLSCurveIDs(),
-		},
 		// Record incoming and outgoing bytes.
-		Incoming: globalConnStats.incInternodeInputBytes,
-		Outgoing: globalConnStats.incInternodeOutputBytes,
-		TraceTo:  globalTrace,
+		Incoming:  globalConnStats.incInternodeInputBytes,
+		Outgoing:  globalConnStats.incInternodeOutputBytes,
+		TraceTo:   globalTrace,
+		RoutePath: grid.RoutePath,
 	})
 	if err != nil {
 		return err
 	}
 	globalGrid.Store(g)
+	return nil
+}
+
+func initGlobalLockGrid(ctx context.Context, eps EndpointServerPools) error {
+	hosts, local := eps.GridHosts()
+	lookupHost := globalDNSCache.LookupHost
+	g, err := grid.NewManager(ctx, grid.ManagerOptions{
+		// Pass Dialer for websocket grid, make sure we do not
+		// provide any DriveOPTimeout() function, as that is not
+		// useful over persistent connections.
+		Dialer: grid.ConnectWSWithRoutePath(
+			grid.ContextDialer(xhttp.DialContextWithLookupHost(lookupHost, xhttp.NewInternodeDialContext(rest.DefaultTimeout, globalTCPOptions.ForWebsocket()))),
+			newCachedAuthToken(),
+			&tls.Config{
+				RootCAs:          globalRootCAs,
+				CipherSuites:     fips.TLSCiphers(),
+				CurvePreferences: fips.TLSCurveIDs(),
+			}, grid.RouteLockPath),
+		Local:        local,
+		Hosts:        hosts,
+		AuthToken:    validateStorageRequestToken,
+		AuthFn:       newCachedAuthToken(),
+		BlockConnect: globalGridStart,
+		// Record incoming and outgoing bytes.
+		Incoming:  globalConnStats.incInternodeInputBytes,
+		Outgoing:  globalConnStats.incInternodeOutputBytes,
+		TraceTo:   globalTrace,
+		RoutePath: grid.RouteLockPath,
+	})
+	if err != nil {
+		return err
+	}
+	globalLockGrid.Store(g)
 	return nil
 }

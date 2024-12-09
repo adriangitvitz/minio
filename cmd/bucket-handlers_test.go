@@ -32,7 +32,7 @@ import (
 
 // Wrapper for calling RemoveBucket HTTP handler tests for both Erasure multiple disks and single node setup.
 func TestRemoveBucketHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testRemoveBucketHandler, []string{"RemoveBucket"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testRemoveBucketHandler, endpoints: []string{"RemoveBucket"}})
 }
 
 func testRemoveBucketHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -78,7 +78,7 @@ func testRemoveBucketHandler(obj ObjectLayer, instanceType, bucketName string, a
 
 // Wrapper for calling GetBucketPolicy HTTP handler tests for both Erasure multiple disks and single node setup.
 func TestGetBucketLocationHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testGetBucketLocationHandler, []string{"GetBucketLocation"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testGetBucketLocationHandler, endpoints: []string{"GetBucketLocation"}})
 }
 
 func testGetBucketLocationHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -220,7 +220,7 @@ func testGetBucketLocationHandler(obj ObjectLayer, instanceType, bucketName stri
 
 // Wrapper for calling HeadBucket HTTP handler tests for both Erasure multiple disks and single node setup.
 func TestHeadBucketHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testHeadBucketHandler, []string{"HeadBucket"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testHeadBucketHandler, endpoints: []string{"HeadBucket"}})
 }
 
 func testHeadBucketHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -252,7 +252,7 @@ func testHeadBucketHandler(obj ObjectLayer, instanceType, bucketName string, api
 		},
 		// Test case - 3.
 		// Testing for signature mismatch error.
-		// setting invalid acess and secret key.
+		// setting invalid access and secret key.
 		{
 			bucketName:         bucketName,
 			accessKey:          "abcd",
@@ -322,7 +322,7 @@ func testHeadBucketHandler(obj ObjectLayer, instanceType, bucketName string, api
 
 // Wrapper for calling TestListMultipartUploadsHandler tests for both Erasure multiple disks and single node setup.
 func TestListMultipartUploadsHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testListMultipartUploadsHandler, []string{"ListMultipartUploads"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testListMultipartUploadsHandler, endpoints: []string{"ListMultipartUploads"}})
 }
 
 // testListMultipartUploadsHandler - Tests validate listing of multipart uploads.
@@ -415,7 +415,7 @@ func testListMultipartUploadsHandler(obj ObjectLayer, instanceType, bucketName s
 			shouldPass:         false,
 		},
 		// Test case - 6.
-		// Setting a negative value to max-uploads paramater, should result in http.StatusBadRequest.
+		// Setting a negative value to max-uploads parameter, should result in http.StatusBadRequest.
 		{
 			bucket:             bucketName,
 			prefix:             "",
@@ -558,7 +558,7 @@ func testListMultipartUploadsHandler(obj ObjectLayer, instanceType, bucketName s
 
 // Wrapper for calling TestListBucketsHandler tests for both Erasure multiple disks and single node setup.
 func TestListBucketsHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testListBucketsHandler, []string{"ListBuckets"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testListBucketsHandler, endpoints: []string{"ListBuckets"}})
 }
 
 // testListBucketsHandler - Tests validate listing of buckets.
@@ -580,7 +580,7 @@ func testListBucketsHandler(obj ObjectLayer, instanceType, bucketName string, ap
 			expectedRespStatus: http.StatusOK,
 		},
 		// Test case - 2.
-		// Test case with invalid accessKey to produce and validate Signature MisMatch error.
+		// Test case with invalid accessKey to produce and validate Signature Mismatch error.
 		{
 			bucketName:         bucketName,
 			accessKey:          "abcd",
@@ -649,7 +649,7 @@ func testListBucketsHandler(obj ObjectLayer, instanceType, bucketName string, ap
 
 // Wrapper for calling DeleteMultipleObjects HTTP handler tests for both Erasure multiple disks and single node setup.
 func TestAPIDeleteMultipleObjectsHandler(t *testing.T) {
-	ExecObjectLayerAPITest(t, testAPIDeleteMultipleObjectsHandler, []string{"DeleteMultipleObjects", "PutBucketPolicy"})
+	ExecObjectLayerAPITest(ExecObjectLayerAPITestArgs{t: t, objAPITest: testAPIDeleteMultipleObjectsHandler, endpoints: []string{"DeleteMultipleObjects", "PutBucketPolicy"}})
 }
 
 func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler,
@@ -880,6 +880,15 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 			expectedContent:    encodedAnonResponseWithPartialPublicAccess,
 			expectedRespStatus: http.StatusOK,
 		},
+		// Test case - 7.
+		// Bucket does not exist.
+		7: {
+			bucket:             "unknown-bucket-name",
+			objects:            successRequest0,
+			accessKey:          credentials.AccessKey,
+			secretKey:          credentials.SecretKey,
+			expectedRespStatus: http.StatusNotFound,
+		},
 	}
 
 	for i, testCase := range testCases {
@@ -888,13 +897,12 @@ func testAPIDeleteMultipleObjectsHandler(obj ObjectLayer, instanceType, bucketNa
 
 		// Generate a signed or anonymous request based on the testCase
 		if testCase.accessKey != "" {
-			req, err = newTestSignedRequestV4(http.MethodPost, getDeleteMultipleObjectsURL("", bucketName),
+			req, err = newTestSignedRequestV4(http.MethodPost, getDeleteMultipleObjectsURL("", testCase.bucket),
 				int64(len(testCase.objects)), bytes.NewReader(testCase.objects), testCase.accessKey, testCase.secretKey, nil)
 		} else {
-			req, err = newTestRequest(http.MethodPost, getDeleteMultipleObjectsURL("", bucketName),
+			req, err = newTestRequest(http.MethodPost, getDeleteMultipleObjectsURL("", testCase.bucket),
 				int64(len(testCase.objects)), bytes.NewReader(testCase.objects))
 		}
-
 		if err != nil {
 			t.Fatalf("Failed to create HTTP request for DeleteMultipleObjects: <ERROR> %v", err)
 		}

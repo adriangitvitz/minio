@@ -21,11 +21,13 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/minio/pkg/v2/env"
-	xnet "github.com/minio/pkg/v2/net"
+	"github.com/minio/pkg/v3/env"
+	xnet "github.com/minio/pkg/v3/net"
 
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/logger/target/http"
@@ -39,13 +41,17 @@ type Console struct {
 
 // Audit/Logger constants
 const (
-	Endpoint   = "endpoint"
-	AuthToken  = "auth_token"
-	ClientCert = "client_cert"
-	ClientKey  = "client_key"
-	QueueSize  = "queue_size"
-	QueueDir   = "queue_dir"
-	Proxy      = "proxy"
+	Endpoint      = "endpoint"
+	AuthToken     = "auth_token"
+	ClientCert    = "client_cert"
+	ClientKey     = "client_key"
+	BatchSize     = "batch_size"
+	QueueSize     = "queue_size"
+	QueueDir      = "queue_dir"
+	MaxRetry      = "max_retry"
+	RetryInterval = "retry_interval"
+	Proxy         = "proxy"
+	httpTimeout   = "http_timeout"
 
 	KafkaBrokers       = "brokers"
 	KafkaTopic         = "topic"
@@ -62,22 +68,30 @@ const (
 	KafkaQueueDir      = "queue_dir"
 	KafkaQueueSize     = "queue_size"
 
-	EnvLoggerWebhookEnable     = "MINIO_LOGGER_WEBHOOK_ENABLE"
-	EnvLoggerWebhookEndpoint   = "MINIO_LOGGER_WEBHOOK_ENDPOINT"
-	EnvLoggerWebhookAuthToken  = "MINIO_LOGGER_WEBHOOK_AUTH_TOKEN"
-	EnvLoggerWebhookClientCert = "MINIO_LOGGER_WEBHOOK_CLIENT_CERT"
-	EnvLoggerWebhookClientKey  = "MINIO_LOGGER_WEBHOOK_CLIENT_KEY"
-	EnvLoggerWebhookProxy      = "MINIO_LOGGER_WEBHOOK_PROXY"
-	EnvLoggerWebhookQueueSize  = "MINIO_LOGGER_WEBHOOK_QUEUE_SIZE"
-	EnvLoggerWebhookQueueDir   = "MINIO_LOGGER_WEBHOOK_QUEUE_DIR"
+	EnvLoggerWebhookEnable        = "MINIO_LOGGER_WEBHOOK_ENABLE"
+	EnvLoggerWebhookEndpoint      = "MINIO_LOGGER_WEBHOOK_ENDPOINT"
+	EnvLoggerWebhookAuthToken     = "MINIO_LOGGER_WEBHOOK_AUTH_TOKEN"
+	EnvLoggerWebhookClientCert    = "MINIO_LOGGER_WEBHOOK_CLIENT_CERT"
+	EnvLoggerWebhookClientKey     = "MINIO_LOGGER_WEBHOOK_CLIENT_KEY"
+	EnvLoggerWebhookProxy         = "MINIO_LOGGER_WEBHOOK_PROXY"
+	EnvLoggerWebhookBatchSize     = "MINIO_LOGGER_WEBHOOK_BATCH_SIZE"
+	EnvLoggerWebhookQueueSize     = "MINIO_LOGGER_WEBHOOK_QUEUE_SIZE"
+	EnvLoggerWebhookQueueDir      = "MINIO_LOGGER_WEBHOOK_QUEUE_DIR"
+	EnvLoggerWebhookMaxRetry      = "MINIO_LOGGER_WEBHOOK_MAX_RETRY"
+	EnvLoggerWebhookRetryInterval = "MINIO_LOGGER_WEBHOOK_RETRY_INTERVAL"
+	EnvLoggerWebhookHTTPTimeout   = "MINIO_LOGGER_WEBHOOK_HTTP_TIMEOUT"
 
-	EnvAuditWebhookEnable     = "MINIO_AUDIT_WEBHOOK_ENABLE"
-	EnvAuditWebhookEndpoint   = "MINIO_AUDIT_WEBHOOK_ENDPOINT"
-	EnvAuditWebhookAuthToken  = "MINIO_AUDIT_WEBHOOK_AUTH_TOKEN"
-	EnvAuditWebhookClientCert = "MINIO_AUDIT_WEBHOOK_CLIENT_CERT"
-	EnvAuditWebhookClientKey  = "MINIO_AUDIT_WEBHOOK_CLIENT_KEY"
-	EnvAuditWebhookQueueSize  = "MINIO_AUDIT_WEBHOOK_QUEUE_SIZE"
-	EnvAuditWebhookQueueDir   = "MINIO_AUDIT_WEBHOOK_QUEUE_DIR"
+	EnvAuditWebhookEnable        = "MINIO_AUDIT_WEBHOOK_ENABLE"
+	EnvAuditWebhookEndpoint      = "MINIO_AUDIT_WEBHOOK_ENDPOINT"
+	EnvAuditWebhookAuthToken     = "MINIO_AUDIT_WEBHOOK_AUTH_TOKEN"
+	EnvAuditWebhookClientCert    = "MINIO_AUDIT_WEBHOOK_CLIENT_CERT"
+	EnvAuditWebhookClientKey     = "MINIO_AUDIT_WEBHOOK_CLIENT_KEY"
+	EnvAuditWebhookBatchSize     = "MINIO_AUDIT_WEBHOOK_BATCH_SIZE"
+	EnvAuditWebhookQueueSize     = "MINIO_AUDIT_WEBHOOK_QUEUE_SIZE"
+	EnvAuditWebhookQueueDir      = "MINIO_AUDIT_WEBHOOK_QUEUE_DIR"
+	EnvAuditWebhookMaxRetry      = "MINIO_AUDIT_WEBHOOK_MAX_RETRY"
+	EnvAuditWebhookRetryInterval = "MINIO_AUDIT_WEBHOOK_RETRY_INTERVAL"
+	EnvAuditWebhookHTTPTimeout   = "MINIO_AUDIT_WEBHOOK_HTTP_TIMEOUT"
 
 	EnvKafkaEnable        = "MINIO_AUDIT_KAFKA_ENABLE"
 	EnvKafkaBrokers       = "MINIO_AUDIT_KAFKA_BROKERS"
@@ -99,7 +113,10 @@ const (
 	auditTargetNamePrefix  = "audit-"
 )
 
-var errInvalidQueueSize = errors.New("invalid queue_size value")
+var (
+	errInvalidQueueSize = errors.New("invalid queue_size value")
+	errInvalidBatchSize = errors.New("invalid batch_size value")
+)
 
 // Default KVS for loggerHTTP and loggerAuditHTTP
 var (
@@ -129,12 +146,28 @@ var (
 			Value: "",
 		},
 		config.KV{
+			Key:   BatchSize,
+			Value: "1",
+		},
+		config.KV{
 			Key:   QueueSize,
 			Value: "100000",
 		},
 		config.KV{
 			Key:   QueueDir,
 			Value: "",
+		},
+		config.KV{
+			Key:   MaxRetry,
+			Value: "0",
+		},
+		config.KV{
+			Key:   RetryInterval,
+			Value: "3s",
+		},
+		config.KV{
+			Key:   httpTimeout,
+			Value: "5s",
 		},
 	}
 
@@ -160,12 +193,28 @@ var (
 			Value: "",
 		},
 		config.KV{
+			Key:   BatchSize,
+			Value: "1",
+		},
+		config.KV{
 			Key:   QueueSize,
 			Value: "100000",
 		},
 		config.KV{
 			Key:   QueueDir,
 			Value: "",
+		},
+		config.KV{
+			Key:   MaxRetry,
+			Value: "0",
+		},
+		config.KV{
+			Key:   RetryInterval,
+			Value: "3s",
+		},
+		config.KV{
+			Key:   httpTimeout,
+			Value: "5s",
 		},
 	}
 
@@ -285,7 +334,7 @@ func lookupLegacyConfigForSubSys(ctx context.Context, subSys string) Config {
 			}
 			url, err := xnet.ParseHTTPURL(endpoint)
 			if err != nil {
-				LogOnceIf(ctx, err, "logger-webhook-"+endpoint)
+				LogOnceIf(ctx, "logging", err, "logger-webhook-"+endpoint)
 				continue
 			}
 			cfg.HTTP[target] = http.Config{
@@ -313,7 +362,7 @@ func lookupLegacyConfigForSubSys(ctx context.Context, subSys string) Config {
 			}
 			url, err := xnet.ParseHTTPURL(endpoint)
 			if err != nil {
-				LogOnceIf(ctx, err, "audit-webhook-"+endpoint)
+				LogOnceIf(ctx, "logging", err, "audit-webhook-"+endpoint)
 				continue
 			}
 			cfg.AuditWebhook[target] = http.Config{
@@ -435,16 +484,54 @@ func lookupLoggerWebhookConfig(scfg config.Config, cfg Config) (Config, error) {
 		if queueSize <= 0 {
 			return cfg, errInvalidQueueSize
 		}
+		batchSizeCfgVal := getCfgVal(EnvLoggerWebhookBatchSize, k, kv.Get(BatchSize))
+		batchSize, err := strconv.Atoi(batchSizeCfgVal)
+		if err != nil {
+			return cfg, err
+		}
+		if batchSize <= 0 {
+			return cfg, errInvalidBatchSize
+		}
+		maxRetryCfgVal := getCfgVal(EnvLoggerWebhookMaxRetry, k, kv.Get(MaxRetry))
+		maxRetry, err := strconv.Atoi(maxRetryCfgVal)
+		if err != nil {
+			return cfg, err
+		}
+		if maxRetry < 0 {
+			return cfg, fmt.Errorf("invalid %s max_retry", maxRetryCfgVal)
+		}
+		retryIntervalCfgVal := getCfgVal(EnvLoggerWebhookRetryInterval, k, kv.Get(RetryInterval))
+		retryInterval, err := time.ParseDuration(retryIntervalCfgVal)
+		if err != nil {
+			return cfg, err
+		}
+		if retryInterval > time.Minute {
+			return cfg, fmt.Errorf("maximum allowed value for retry interval is '1m': %s", retryIntervalCfgVal)
+		}
+
+		httpTimeoutCfgVal := getCfgVal(EnvLoggerWebhookHTTPTimeout, k, kv.Get(httpTimeout))
+		httpTimeout, err := time.ParseDuration(httpTimeoutCfgVal)
+		if err != nil {
+			return cfg, err
+		}
+		if httpTimeout < time.Second {
+			return cfg, fmt.Errorf("minimum value allowed for http_timeout is '1s': %s", httpTimeout)
+		}
+
 		cfg.HTTP[k] = http.Config{
-			Enabled:    true,
-			Endpoint:   url,
-			AuthToken:  getCfgVal(EnvLoggerWebhookAuthToken, k, kv.Get(AuthToken)),
-			ClientCert: clientCert,
-			ClientKey:  clientKey,
-			Proxy:      getCfgVal(EnvLoggerWebhookProxy, k, kv.Get(Proxy)),
-			QueueSize:  queueSize,
-			QueueDir:   getCfgVal(EnvLoggerWebhookQueueDir, k, kv.Get(QueueDir)),
-			Name:       loggerTargetNamePrefix + k,
+			HTTPTimeout: httpTimeout,
+			Enabled:     true,
+			Endpoint:    url,
+			AuthToken:   getCfgVal(EnvLoggerWebhookAuthToken, k, kv.Get(AuthToken)),
+			ClientCert:  clientCert,
+			ClientKey:   clientKey,
+			Proxy:       getCfgVal(EnvLoggerWebhookProxy, k, kv.Get(Proxy)),
+			BatchSize:   batchSize,
+			QueueSize:   queueSize,
+			QueueDir:    getCfgVal(EnvLoggerWebhookQueueDir, k, kv.Get(QueueDir)),
+			MaxRetry:    maxRetry,
+			RetryIntvl:  retryInterval,
+			Name:        loggerTargetNamePrefix + k,
 		}
 	}
 	return cfg, nil
@@ -488,15 +575,54 @@ func lookupAuditWebhookConfig(scfg config.Config, cfg Config) (Config, error) {
 		if queueSize <= 0 {
 			return cfg, errInvalidQueueSize
 		}
+		batchSizeCfgVal := getCfgVal(EnvAuditWebhookBatchSize, k, kv.Get(BatchSize))
+		batchSize, err := strconv.Atoi(batchSizeCfgVal)
+		if err != nil {
+			return cfg, err
+		}
+		if batchSize <= 0 {
+			return cfg, errInvalidBatchSize
+		}
+		maxRetryCfgVal := getCfgVal(EnvAuditWebhookMaxRetry, k, kv.Get(MaxRetry))
+		maxRetry, err := strconv.Atoi(maxRetryCfgVal)
+		if err != nil {
+			return cfg, err
+		}
+		if maxRetry < 0 {
+			return cfg, fmt.Errorf("invalid %s max_retry", maxRetryCfgVal)
+		}
+
+		retryIntervalCfgVal := getCfgVal(EnvAuditWebhookRetryInterval, k, kv.Get(RetryInterval))
+		retryInterval, err := time.ParseDuration(retryIntervalCfgVal)
+		if err != nil {
+			return cfg, err
+		}
+		if retryInterval > time.Minute {
+			return cfg, fmt.Errorf("maximum allowed value for retry interval is '1m': %s", retryIntervalCfgVal)
+		}
+
+		httpTimeoutCfgVal := getCfgVal(EnvAuditWebhookHTTPTimeout, k, kv.Get(httpTimeout))
+		httpTimeout, err := time.ParseDuration(httpTimeoutCfgVal)
+		if err != nil {
+			return cfg, err
+		}
+		if httpTimeout < time.Second {
+			return cfg, fmt.Errorf("minimum value allowed for http_timeout is '1s': %s", httpTimeout)
+		}
+
 		cfg.AuditWebhook[k] = http.Config{
-			Enabled:    true,
-			Endpoint:   url,
-			AuthToken:  getCfgVal(EnvAuditWebhookAuthToken, k, kv.Get(AuthToken)),
-			ClientCert: clientCert,
-			ClientKey:  clientKey,
-			QueueSize:  queueSize,
-			QueueDir:   getCfgVal(EnvAuditWebhookQueueDir, k, kv.Get(QueueDir)),
-			Name:       auditTargetNamePrefix + k,
+			HTTPTimeout: httpTimeout,
+			Enabled:     true,
+			Endpoint:    url,
+			AuthToken:   getCfgVal(EnvAuditWebhookAuthToken, k, kv.Get(AuthToken)),
+			ClientCert:  clientCert,
+			ClientKey:   clientKey,
+			BatchSize:   batchSize,
+			QueueSize:   queueSize,
+			QueueDir:    getCfgVal(EnvAuditWebhookQueueDir, k, kv.Get(QueueDir)),
+			MaxRetry:    maxRetry,
+			RetryIntvl:  retryInterval,
+			Name:        auditTargetNamePrefix + k,
 		}
 	}
 	return cfg, nil

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -31,7 +32,7 @@ import (
 
 // Returns the latest updated FileInfo files and error in case of failure.
 func getLatestFileInfo(ctx context.Context, partsMetadata []FileInfo, defaultParityCount int, errs []error) (FileInfo, error) {
-	// There should be atleast half correct entries, if not return failure
+	// There should be at least half correct entries, if not return failure
 	expectedRQuorum := len(partsMetadata) / 2
 	if defaultParityCount == 0 {
 		// if parity count is '0', we expected all entries to be present.
@@ -57,7 +58,7 @@ func getLatestFileInfo(ctx context.Context, partsMetadata []FileInfo, defaultPar
 		return FileInfo{}, errErasureReadQuorum
 	}
 
-	// Interate through all the modTimes and count the FileInfo(s) with latest time.
+	// Iterate through all the modTimes and count the FileInfo(s) with latest time.
 	for index, t := range modTimes {
 		if partsMetadata[index].IsValid() && t.Equal(modTime) {
 			latestFileInfo = partsMetadata[index]
@@ -147,6 +148,10 @@ func TestCommonTime(t *testing.T) {
 // TestListOnlineDisks - checks if listOnlineDisks and outDatedDisks
 // are consistent with each other.
 func TestListOnlineDisks(t *testing.T) {
+	if runtime.GOOS == globalWindowsOSName {
+		t.Skip()
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -230,7 +235,7 @@ func TestListOnlineDisks(t *testing.T) {
 	}
 
 	object := "object"
-	data := bytes.Repeat([]byte("a"), smallFileThreshold*16)
+	data := bytes.Repeat([]byte("a"), smallFileThreshold*32)
 	z := obj.(*erasureServerPools)
 
 	erasureDisks, err := z.GetDisks(0, 0)
@@ -246,7 +251,7 @@ func TestListOnlineDisks(t *testing.T) {
 				t.Fatalf("Failed to putObject %v", err)
 			}
 
-			partsMetadata, errs := readAllFileInfo(ctx, erasureDisks, bucket, object, "", false, true)
+			partsMetadata, errs := readAllFileInfo(ctx, erasureDisks, "", bucket, object, "", false, true)
 			fi, err := getLatestFileInfo(ctx, partsMetadata, z.serverPools[0].sets[0].defaultParityCount, errs)
 			if err != nil {
 				t.Fatalf("Failed to getLatestFileInfo %v", err)
@@ -308,9 +313,8 @@ func TestListOnlineDisks(t *testing.T) {
 				t.Fatalf("Expected modTime to be equal to %v but was found to be %v",
 					test.expectedTime, modTime)
 			}
-			availableDisks, newErrs, _ := disksWithAllParts(ctx, onlineDisks, partsMetadata,
-				test.errs, fi, bucket, object, madmin.HealDeepScan)
-			test.errs = newErrs
+			availableDisks, _, _ := disksWithAllParts(ctx, onlineDisks, partsMetadata,
+				test.errs, fi, false, bucket, object, madmin.HealDeepScan)
 
 			if test._tamperBackend != noTamper {
 				if tamperedIndex != -1 && availableDisks[tamperedIndex] != nil {
@@ -424,7 +428,7 @@ func TestListOnlineDisksSmallObjects(t *testing.T) {
 				t.Fatalf("Failed to putObject %v", err)
 			}
 
-			partsMetadata, errs := readAllFileInfo(ctx, erasureDisks, bucket, object, "", true, true)
+			partsMetadata, errs := readAllFileInfo(ctx, erasureDisks, "", bucket, object, "", true, true)
 			fi, err := getLatestFileInfo(ctx, partsMetadata, z.serverPools[0].sets[0].defaultParityCount, errs)
 			if err != nil {
 				t.Fatalf("Failed to getLatestFileInfo %v", err)
@@ -437,7 +441,7 @@ func TestListOnlineDisksSmallObjects(t *testing.T) {
 				partsMetadata[j].ModTime = test.modTimes[j]
 			}
 
-			if erasureDisks, err = writeUniqueFileInfo(ctx, erasureDisks, bucket, object, partsMetadata, diskCount(erasureDisks)); err != nil {
+			if erasureDisks, err = writeUniqueFileInfo(ctx, erasureDisks, "", bucket, object, partsMetadata, diskCount(erasureDisks)); err != nil {
 				t.Fatal(ctx, err)
 			}
 
@@ -491,9 +495,8 @@ func TestListOnlineDisksSmallObjects(t *testing.T) {
 					test.expectedTime, modTime)
 			}
 
-			availableDisks, newErrs, _ := disksWithAllParts(ctx, onlineDisks, partsMetadata,
-				test.errs, fi, bucket, object, madmin.HealDeepScan)
-			test.errs = newErrs
+			availableDisks, _, _ := disksWithAllParts(ctx, onlineDisks, partsMetadata,
+				test.errs, fi, false, bucket, object, madmin.HealDeepScan)
 
 			if test._tamperBackend != noTamper {
 				if tamperedIndex != -1 && availableDisks[tamperedIndex] != nil {
@@ -534,7 +537,7 @@ func TestDisksWithAllParts(t *testing.T) {
 		t.Fatalf("Failed to putObject %v", err)
 	}
 
-	_, errs := readAllFileInfo(ctx, erasureDisks, bucket, object, "", false, true)
+	_, errs := readAllFileInfo(ctx, erasureDisks, "", bucket, object, "", false, true)
 	readQuorum := len(erasureDisks) / 2
 	if reducedErr := reduceReadQuorumErrs(ctx, errs, objectOpIgnoredErrs, readQuorum); reducedErr != nil {
 		t.Fatalf("Failed to read xl meta data %v", reducedErr)
@@ -542,7 +545,7 @@ func TestDisksWithAllParts(t *testing.T) {
 
 	// Test 1: Test that all disks are returned without any failures with
 	// unmodified meta data
-	partsMetadata, errs := readAllFileInfo(ctx, erasureDisks, bucket, object, "", false, true)
+	partsMetadata, errs := readAllFileInfo(ctx, erasureDisks, "", bucket, object, "", false, true)
 	if err != nil {
 		t.Fatalf("Failed to read xl meta data %v", err)
 	}
@@ -554,16 +557,16 @@ func TestDisksWithAllParts(t *testing.T) {
 
 	erasureDisks, _, _ = listOnlineDisks(erasureDisks, partsMetadata, errs, readQuorum)
 
-	filteredDisks, errs, _ := disksWithAllParts(ctx, erasureDisks, partsMetadata,
-		errs, fi, bucket, object, madmin.HealDeepScan)
+	filteredDisks, _, dataErrsPerDisk := disksWithAllParts(ctx, erasureDisks, partsMetadata,
+		errs, fi, false, bucket, object, madmin.HealDeepScan)
 
 	if len(filteredDisks) != len(erasureDisks) {
 		t.Errorf("Unexpected number of drives: %d", len(filteredDisks))
 	}
 
 	for diskIndex, disk := range filteredDisks {
-		if errs[diskIndex] != nil {
-			t.Errorf("Unexpected error %s", errs[diskIndex])
+		if partNeedsHealing(dataErrsPerDisk[diskIndex]) {
+			t.Errorf("Unexpected error: %v", dataErrsPerDisk[diskIndex])
 		}
 
 		if disk == nil {
@@ -577,7 +580,7 @@ func TestDisksWithAllParts(t *testing.T) {
 
 	errs = make([]error, len(erasureDisks))
 	filteredDisks, _, _ = disksWithAllParts(ctx, erasureDisks, partsMetadata,
-		errs, fi, bucket, object, madmin.HealDeepScan)
+		errs, fi, false, bucket, object, madmin.HealDeepScan)
 
 	if len(filteredDisks) != len(erasureDisks) {
 		t.Errorf("Unexpected number of drives: %d", len(filteredDisks))
@@ -598,7 +601,7 @@ func TestDisksWithAllParts(t *testing.T) {
 
 	errs = make([]error, len(erasureDisks))
 	filteredDisks, _, _ = disksWithAllParts(ctx, erasureDisks, partsMetadata,
-		errs, fi, bucket, object, madmin.HealDeepScan)
+		errs, fi, false, bucket, object, madmin.HealDeepScan)
 
 	if len(filteredDisks) != len(erasureDisks) {
 		t.Errorf("Unexpected number of drives: %d", len(filteredDisks))
@@ -634,8 +637,8 @@ func TestDisksWithAllParts(t *testing.T) {
 	}
 
 	errs = make([]error, len(erasureDisks))
-	filteredDisks, errs, _ = disksWithAllParts(ctx, erasureDisks, partsMetadata,
-		errs, fi, bucket, object, madmin.HealDeepScan)
+	filteredDisks, dataErrsPerDisk, _ = disksWithAllParts(ctx, erasureDisks, partsMetadata,
+		errs, fi, false, bucket, object, madmin.HealDeepScan)
 
 	if len(filteredDisks) != len(erasureDisks) {
 		t.Errorf("Unexpected number of drives: %d", len(filteredDisks))
@@ -646,15 +649,15 @@ func TestDisksWithAllParts(t *testing.T) {
 			if disk != nil {
 				t.Errorf("Drive not filtered as expected, drive: %d", diskIndex)
 			}
-			if errs[diskIndex] == nil {
-				t.Errorf("Expected error not received, driveIndex: %d", diskIndex)
+			if !partNeedsHealing(dataErrsPerDisk[diskIndex]) {
+				t.Errorf("Disk expected to be healed, driveIndex: %d", diskIndex)
 			}
 		} else {
 			if disk == nil {
 				t.Errorf("Drive erroneously filtered, driveIndex: %d", diskIndex)
 			}
-			if errs[diskIndex] != nil {
-				t.Errorf("Unexpected error, %s, driveIndex: %d", errs[diskIndex], diskIndex)
+			if partNeedsHealing(dataErrsPerDisk[diskIndex]) {
+				t.Errorf("Disk not expected to be healed, driveIndex: %d", diskIndex)
 			}
 
 		}

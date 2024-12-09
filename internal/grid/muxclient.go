@@ -26,29 +26,31 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/minio/minio/internal/logger"
+	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/zeebo/xxh3"
 )
 
 // muxClient is a stateful connection to a remote.
 type muxClient struct {
-	MuxID            uint64
-	SendSeq, RecvSeq uint32
-	LastPong         int64
-	BaseFlags        Flags
-	ctx              context.Context
-	cancelFn         context.CancelCauseFunc
-	parent           *Connection
-	respWait         chan<- Response
-	respMu           sync.Mutex
-	singleResp       bool
-	closed           bool
-	stateless        bool
-	acked            bool
-	init             bool
-	deadline         time.Duration
-	outBlock         chan struct{}
-	subroute         *subHandlerID
+	MuxID              uint64
+	SendSeq, RecvSeq   uint32
+	LastPong           int64
+	BaseFlags          Flags
+	ctx                context.Context
+	cancelFn           context.CancelCauseFunc
+	parent             *Connection
+	respWait           chan<- Response
+	respMu             sync.Mutex
+	singleResp         bool
+	closed             bool
+	stateless          bool
+	acked              bool
+	init               bool
+	deadline           time.Duration
+	outBlock           chan struct{}
+	subroute           *subHandlerID
+	respErr            atomic.Pointer[error]
+	clientPingInterval time.Duration
 }
 
 // Response is a response from the server.
@@ -60,12 +62,13 @@ type Response struct {
 func newMuxClient(ctx context.Context, muxID uint64, parent *Connection) *muxClient {
 	ctx, cancelFn := context.WithCancelCause(ctx)
 	return &muxClient{
-		MuxID:     muxID,
-		ctx:       ctx,
-		cancelFn:  cancelFn,
-		parent:    parent,
-		LastPong:  time.Now().Unix(),
-		BaseFlags: parent.baseFlags,
+		MuxID:              muxID,
+		ctx:                ctx,
+		cancelFn:           cancelFn,
+		parent:             parent,
+		LastPong:           time.Now().UnixNano(),
+		BaseFlags:          parent.baseFlags,
+		clientPingInterval: parent.clientPingInterval,
 	}
 }
 
@@ -89,7 +92,13 @@ func (m *muxClient) roundtrip(h HandlerID, req []byte) ([]byte, error) {
 		msg.Flags |= FlagSubroute
 	}
 	ch := make(chan Response, 1)
+	m.respMu.Lock()
+	if m.closed {
+		m.respMu.Unlock()
+		return nil, ErrDisconnected
+	}
 	m.respWait = ch
+	m.respMu.Unlock()
 	ctx := m.ctx
 
 	// Add deadline if none.
@@ -99,8 +108,8 @@ func (m *muxClient) roundtrip(h HandlerID, req []byte) ([]byte, error) {
 		ctx, cancel = context.WithTimeout(ctx, defaultSingleRequestTimeout)
 		defer cancel()
 	}
-	// Send... (no need for lock yet)
-	if err := m.sendLocked(msg); err != nil {
+	// Send request
+	if err := m.send(msg); err != nil {
 		return nil, err
 	}
 	if debugReqs {
@@ -137,7 +146,7 @@ func (m *muxClient) send(msg message) error {
 // sendLocked the message. msg.Seq and msg.MuxID will be set.
 // m.respMu must be held.
 func (m *muxClient) sendLocked(msg message) error {
-	dst := GetByteBuffer()[:0]
+	dst := GetByteBufferCap(msg.Msgsize())
 	msg.Seq = m.SendSeq
 	msg.MuxID = m.MuxID
 	msg.Flags |= m.BaseFlags
@@ -165,7 +174,7 @@ func (m *muxClient) sendLocked(msg message) error {
 		h := xxh3.Hash(dst)
 		dst = binary.LittleEndian.AppendUint32(dst, uint32(h))
 	}
-	return m.parent.send(dst)
+	return m.parent.send(m.ctx, dst)
 }
 
 // RequestStateless will send a single payload request and stream back results.
@@ -213,7 +222,13 @@ func (m *muxClient) RequestStream(h HandlerID, payload []byte, requests chan []b
 		return nil, errors.New("RequestStream: responses channel is nil")
 	}
 	m.init = true
+	m.respMu.Lock()
+	if m.closed {
+		m.respMu.Unlock()
+		return nil, ErrDisconnected
+	}
 	m.respWait = responses // Route directly to output.
+	m.respMu.Unlock()
 
 	// Try to grab an initial block.
 	m.singleResp = false
@@ -249,31 +264,58 @@ func (m *muxClient) RequestStream(h HandlerID, payload []byte, requests chan []b
 
 	// Spawn simple disconnect
 	if requests == nil {
-		start := time.Now()
-		go m.handleOneWayStream(start, responseCh, responses)
-		return &Stream{responses: responseCh, Requests: nil, ctx: m.ctx, cancel: m.cancelFn}, nil
+		go m.handleOneWayStream(responseCh, responses)
+		return &Stream{responses: responseCh, Requests: nil, ctx: m.ctx, cancel: m.cancelFn, muxID: m.MuxID}, nil
 	}
 
 	// Deliver responses and send unblocks back to the server.
 	go m.handleTwowayResponses(responseCh, responses)
 	go m.handleTwowayRequests(responses, requests)
 
-	return &Stream{responses: responseCh, Requests: requests, ctx: m.ctx, cancel: m.cancelFn}, nil
+	return &Stream{responses: responseCh, Requests: requests, ctx: m.ctx, cancel: m.cancelFn, muxID: m.MuxID}, nil
 }
 
-func (m *muxClient) handleOneWayStream(start time.Time, respHandler chan<- Response, respServer <-chan Response) {
+func (m *muxClient) addErrorNonBlockingClose(respHandler chan<- Response, err error) {
+	m.respMu.Lock()
+	defer m.respMu.Unlock()
+	if !m.closed {
+		m.respErr.Store(&err)
+		// Do not block.
+		select {
+		case respHandler <- Response{Err: err}:
+			xioutil.SafeClose(respHandler)
+		default:
+			go func() {
+				respHandler <- Response{Err: err}
+				xioutil.SafeClose(respHandler)
+			}()
+		}
+		gridLogIf(m.ctx, m.sendLocked(message{Op: OpDisconnectServerMux, MuxID: m.MuxID}))
+		m.closed = true
+	}
+}
+
+// respHandler
+func (m *muxClient) handleOneWayStream(respHandler chan<- Response, respServer <-chan Response) {
 	if debugPrint {
+		start := time.Now()
 		defer func() {
 			fmt.Println("Mux", m.MuxID, "Request took", time.Since(start).Round(time.Millisecond))
 		}()
 	}
-	defer close(respHandler)
+	defer func() {
+		// addErrorNonBlockingClose will close the response channel
+		// - maybe async, so we shouldn't do it here.
+		if m.respErr.Load() == nil {
+			xioutil.SafeClose(respHandler)
+		}
+	}()
 	var pingTimer <-chan time.Time
-	if m.deadline == 0 || m.deadline > clientPingInterval {
-		ticker := time.NewTicker(clientPingInterval)
+	if m.deadline == 0 || m.deadline > m.clientPingInterval {
+		ticker := time.NewTicker(m.clientPingInterval)
 		defer ticker.Stop()
 		pingTimer = ticker.C
-		atomic.StoreInt64(&m.LastPong, time.Now().Unix())
+		atomic.StoreInt64(&m.LastPong, time.Now().UnixNano())
 	}
 	defer m.parent.deleteMux(false, m.MuxID)
 	for {
@@ -282,79 +324,118 @@ func (m *muxClient) handleOneWayStream(start time.Time, respHandler chan<- Respo
 			if debugPrint {
 				fmt.Println("Client sending disconnect to mux", m.MuxID)
 			}
-			m.respMu.Lock()
-			defer m.respMu.Unlock() // We always return in this path.
-			if !m.closed {
-				respHandler <- Response{Err: context.Cause(m.ctx)}
-				logger.LogIf(m.ctx, m.sendLocked(message{Op: OpDisconnectServerMux, MuxID: m.MuxID}))
-				m.closeLocked()
+			err := context.Cause(m.ctx)
+			if !errors.Is(err, errStreamEOF) {
+				m.addErrorNonBlockingClose(respHandler, err)
 			}
 			return
 		case resp, ok := <-respServer:
 			if !ok {
 				return
 			}
+		sendResp:
 			select {
 			case respHandler <- resp:
 				m.respMu.Lock()
 				if !m.closed {
-					logger.LogIf(m.ctx, m.sendLocked(message{Op: OpUnblockSrvMux, MuxID: m.MuxID}))
+					gridLogIf(m.ctx, m.sendLocked(message{Op: OpUnblockSrvMux, MuxID: m.MuxID}))
 				}
 				m.respMu.Unlock()
 			case <-m.ctx.Done():
 				// Client canceled. Don't block.
 				// Next loop will catch it.
+			case <-pingTimer:
+				if !m.doPing(respHandler) {
+					return
+				}
+				goto sendResp
 			}
 		case <-pingTimer:
-			if time.Since(time.Unix(atomic.LoadInt64(&m.LastPong), 0)) > clientPingInterval*2 {
-				m.respMu.Lock()
-				defer m.respMu.Unlock() // We always return in this path.
-				if !m.closed {
-					respHandler <- Response{Err: ErrDisconnected}
-					logger.LogIf(m.ctx, m.sendLocked(message{Op: OpDisconnectServerMux, MuxID: m.MuxID}))
-					m.closeLocked()
-				}
+			if !m.doPing(respHandler) {
 				return
 			}
-			// Send new ping.
-			logger.LogIf(m.ctx, m.send(message{Op: OpPing, MuxID: m.MuxID}))
 		}
 	}
 }
 
-func (m *muxClient) handleTwowayResponses(responseCh chan Response, responses chan Response) {
-	defer m.parent.deleteMux(false, m.MuxID)
-	defer close(responseCh)
-	for resp := range responses {
-		responseCh <- resp
+// doPing checks last ping time and sends another ping.
+func (m *muxClient) doPing(respHandler chan<- Response) (ok bool) {
+	m.respMu.Lock()
+	if m.closed {
+		m.respMu.Unlock()
+		// Already closed. This is not an error state;
+		// we may just be delivering the last responses.
+		return true
+	}
+
+	// Only check ping when not closed.
+	if got := time.Since(time.Unix(0, atomic.LoadInt64(&m.LastPong))); got > m.clientPingInterval*2 {
+		m.respMu.Unlock()
+		if debugPrint {
+			fmt.Printf("Mux %d: last pong %v ago, disconnecting\n", m.MuxID, got)
+		}
+		m.addErrorNonBlockingClose(respHandler, ErrDisconnected)
+		return false
+	}
+
+	// Send new ping
+	err := m.sendLocked(message{Op: OpPing, MuxID: m.MuxID})
+	m.respMu.Unlock()
+	if err != nil {
+		m.addErrorNonBlockingClose(respHandler, err)
+	}
+	return err == nil
+}
+
+// responseCh is the channel to that goes to the requester.
+// internalResp is the channel that comes from the server.
+func (m *muxClient) handleTwowayResponses(responseCh chan<- Response, internalResp <-chan Response) {
+	defer func() {
+		m.parent.deleteMux(false, m.MuxID)
+		// addErrorNonBlockingClose will close the response channel.
+		xioutil.SafeClose(responseCh)
+	}()
+
+	// Cancelation and errors are handled by handleTwowayRequests below.
+	for resp := range internalResp {
 		m.send(message{Op: OpUnblockSrvMux, MuxID: m.MuxID})
+		responseCh <- resp
 	}
 }
 
-func (m *muxClient) handleTwowayRequests(responses chan<- Response, requests chan []byte) {
+func (m *muxClient) handleTwowayRequests(errResp chan<- Response, requests <-chan []byte) {
 	var errState bool
-	start := time.Now()
 	if debugPrint {
+		start := time.Now()
 		defer func() {
 			fmt.Println("Mux", m.MuxID, "Request took", time.Since(start).Round(time.Millisecond))
 		}()
 	}
 
+	var pingTimer <-chan time.Time
+	if m.deadline == 0 || m.deadline > m.clientPingInterval {
+		ticker := time.NewTicker(m.clientPingInterval)
+		defer ticker.Stop()
+		pingTimer = ticker.C
+		atomic.StoreInt64(&m.LastPong, time.Now().UnixNano())
+	}
+
 	// Listen for client messages.
-	for {
+reqLoop:
+	for !errState {
 		select {
 		case <-m.ctx.Done():
 			if debugPrint {
 				fmt.Println("Client sending disconnect to mux", m.MuxID)
 			}
-			m.respMu.Lock()
-			defer m.respMu.Unlock()
-			logger.LogIf(m.ctx, m.sendLocked(message{Op: OpDisconnectServerMux, MuxID: m.MuxID}))
-			if !m.closed {
-				responses <- Response{Err: context.Cause(m.ctx)}
-				m.closeLocked()
+			m.addErrorNonBlockingClose(errResp, context.Cause(m.ctx))
+			errState = true
+			continue
+		case <-pingTimer:
+			if !m.doPing(errResp) {
+				errState = true
+				continue
 			}
-			return
 		case req, ok := <-requests:
 			if !ok {
 				// Done send EOF
@@ -364,27 +445,28 @@ func (m *muxClient) handleTwowayRequests(responses chan<- Response, requests cha
 				msg := message{
 					Op:    OpMuxClientMsg,
 					MuxID: m.MuxID,
-					Seq:   1,
 					Flags: FlagEOF,
 				}
 				msg.setZeroPayloadFlag()
 				err := m.send(msg)
 				if err != nil {
-					m.respMu.Lock()
-					responses <- Response{Err: err}
-					m.closeLocked()
-					m.respMu.Unlock()
+					m.addErrorNonBlockingClose(errResp, err)
 				}
-				return
-			}
-			if errState {
-				continue
+				break reqLoop
 			}
 			// Grab a send token.
+		sendReq:
 			select {
 			case <-m.ctx.Done():
+				m.addErrorNonBlockingClose(errResp, context.Cause(m.ctx))
 				errState = true
 				continue
+			case <-pingTimer:
+				if !m.doPing(errResp) {
+					errState = true
+					continue
+				}
+				goto sendReq
 			case <-m.outBlock:
 			}
 			msg := message{
@@ -397,12 +479,39 @@ func (m *muxClient) handleTwowayRequests(responses chan<- Response, requests cha
 			err := m.send(msg)
 			PutByteBuffer(req)
 			if err != nil {
-				responses <- Response{Err: err}
-				m.close()
+				m.addErrorNonBlockingClose(errResp, err)
 				errState = true
 				continue
 			}
 			msg.Seq++
+		}
+	}
+
+	if errState {
+		// Drain requests.
+		for {
+			select {
+			case r, ok := <-requests:
+				if !ok {
+					return
+				}
+				PutByteBuffer(r)
+			default:
+				return
+			}
+		}
+	}
+
+	for !errState {
+		select {
+		case <-m.ctx.Done():
+			if debugPrint {
+				fmt.Println("Client sending disconnect to mux", m.MuxID)
+			}
+			m.addErrorNonBlockingClose(errResp, context.Cause(m.ctx))
+			return
+		case <-pingTimer:
+			errState = !m.doPing(errResp)
 		}
 	}
 }
@@ -435,16 +544,19 @@ func (m *muxClient) response(seq uint32, r Response) {
 			fmt.Println(m.MuxID, m.parent.String(), "CHECKSEQ FAIL", m.RecvSeq, seq)
 		}
 		PutByteBuffer(r.Msg)
+		r.Msg = nil
 		r.Err = ErrIncorrectSequence
 		m.addResponse(r)
 		return
 	}
-	atomic.StoreInt64(&m.LastPong, time.Now().Unix())
+	atomic.StoreInt64(&m.LastPong, time.Now().UnixNano())
 	ok := m.addResponse(r)
 	if !ok {
 		PutByteBuffer(r.Msg)
 	}
 }
+
+var errStreamEOF = errors.New("stream EOF")
 
 // error is a message from the server to disconnect.
 func (m *muxClient) error(err RemoteErr) {
@@ -475,7 +587,7 @@ func (m *muxClient) unblockSend(seq uint32) {
 	select {
 	case m.outBlock <- struct{}{}:
 	default:
-		logger.LogIf(m.ctx, errors.New("output unblocked overflow"))
+		gridLogIf(m.ctx, errors.New("output unblocked overflow"))
 	}
 }
 
@@ -488,7 +600,7 @@ func (m *muxClient) pong(msg pongMsg) {
 		m.addResponse(Response{Err: err})
 		return
 	}
-	atomic.StoreInt64(&m.LastPong, time.Now().Unix())
+	atomic.StoreInt64(&m.LastPong, time.Now().UnixNano())
 }
 
 // addResponse will add a response to the response channel.
@@ -514,7 +626,7 @@ func (m *muxClient) addResponse(r Response) (ok bool) {
 			return
 		}
 		err := errors.New("INTERNAL ERROR: Response was blocked")
-		logger.LogIf(m.ctx, err)
+		gridLogIf(m.ctx, err)
 		m.closeLocked()
 		return false
 	}
@@ -524,7 +636,15 @@ func (m *muxClient) close() {
 	if debugPrint {
 		fmt.Println("closing outgoing mux", m.MuxID)
 	}
-	m.respMu.Lock()
+	if !m.respMu.TryLock() {
+		// Cancel before locking - will unblock any pending sends.
+		if m.cancelFn != nil {
+			m.cancelFn(context.Canceled)
+		}
+		// Wait for senders to release.
+		m.respMu.Lock()
+	}
+
 	defer m.respMu.Unlock()
 	m.closeLocked()
 }
@@ -533,7 +653,10 @@ func (m *muxClient) closeLocked() {
 	if m.closed {
 		return
 	}
-	close(m.respWait)
-	m.respWait = nil
+	// We hold the lock, so nobody can modify m.respWait while we're closing.
+	if m.respWait != nil {
+		xioutil.SafeClose(m.respWait)
+		m.respWait = nil
+	}
 	m.closed = true
 }
